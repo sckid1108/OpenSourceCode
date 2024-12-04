@@ -10,7 +10,7 @@ styles. Below is a list of items that were identified as checklist items in this
 FSM design, we recommend compare your code against the items in this checklist. 
 
 <b>Checklist item:</b> Engineers should generally declare all FSM ports and all FSM internal signals to be 
-of type logic. <i>Note that when you use logic for a port and the preprocessor macro `default_nettype none
+of type logic. <i>Note that when you use "logic" for a port and the preprocessor macro "`default_nettype none"
 you need to  declare the port type either wire or reg otherwise the synthesizer could give you an error.
 -MM </i>
 
