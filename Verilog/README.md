@@ -3,7 +3,7 @@
 I recommend SystemVerilog for everything. 
 Note: Lattice Diamond will support System Verilog if you use the Synopsys Synplify synthesis tool instead of LSE. 
 
-[From SNUG 2019 - FSM Design and Synthesis using System Verilog Part I - Cummings](https://)
+[From SNUG 2019 - FSM Design and Synthesis using System Verilog Part I - Cummings](https://github.com/sckid1108/OpenSourceCode/blob/main/Verilog/Documentation/CummingsSNUG2019SV_FSM1.pdf)
 
 SystemVerilog coding styles help facilitate proper simulation and understanding of the FSM coding 
 styles. Below is a list of items that were identified as checklist items in this paper. After coding your 
