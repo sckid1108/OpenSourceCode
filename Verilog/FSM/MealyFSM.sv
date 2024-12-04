@@ -1,6 +1,6 @@
 
-// Mealy FSM where the outputs are only a function of the current state and inputs
-// ouputs have a 0 cycle delay to settle through combinatorial logic and can have glitches
+// Mealy FSM where the outputs are a function of the current state and inputs and
+// outputs have a 0 cycle delay to settle through combinatorial logic and can have glitches.
 // 2 Always blocks for clarity
 // 1 Hot Encoding
 // State ennumerations can go into PACKAGES to change encoding easily
