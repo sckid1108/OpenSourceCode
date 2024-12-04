@@ -1,6 +1,6 @@
 
 // Moore FSM where the outputs are only a function of the current state
-// ouputs have a 1 cycle delay to settle through combinatorial logic (no glitches)
+// outputs have a 1 cycle delay to settle through combinatorial logic (no glitches)
 // 3 Always blocks for clarity
 // 1 Hot Encoding
 // State enumerations can go into PACKAGES to change encoding easily
