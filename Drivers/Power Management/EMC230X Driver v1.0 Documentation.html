@@ -1,0 +1,887 @@
+<title>EMC230X Driver v1.0 — Tenuvah Designs</title>
+
+<style>
+:root{
+  --bg:#F5F7F9; --surface:#FFFFFF; --surface-2:#EFF2F6;
+  --text:#18202B; --muted:#5C6875; --rule:#E1E6EB; --rule-strong:#C9D2DB;
+  --accent:#B85C15; --accent-soft:#FBEFE2;
+  --ok:#2E7355; --warn:#9A6B18; --danger:#A8322C;
+  --code-bg:#F2F4F7;
+  --font-display:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --font-prose:ui-serif,Georgia,Cambria,"Times New Roman",serif;
+  --font-mono:ui-monospace,SFMono-Regular,"SF Mono","Cascadia Mono",Menlo,Consolas,"Liberation Mono",monospace;
+}
+@media (prefers-color-scheme:dark){
+  :root{
+    --bg:#0D1117; --surface:#151B23; --surface-2:#1B222C;
+    --text:#DDE4EC; --muted:#8B9AAB; --rule:#232C37; --rule-strong:#33404F;
+    --accent:#F09A48; --accent-soft:#2A1F13;
+    --ok:#4CAF87; --warn:#D6A65A; --danger:#E8736C;
+    --code-bg:#111820;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0D1117; --surface:#151B23; --surface-2:#1B222C;
+  --text:#DDE4EC; --muted:#8B9AAB; --rule:#232C37; --rule-strong:#33404F;
+  --accent:#F09A48; --accent-soft:#2A1F13;
+  --ok:#4CAF87; --warn:#D6A65A; --danger:#E8736C;
+  --code-bg:#111820;
+}
+:root[data-theme="light"]{
+  --bg:#F5F7F9; --surface:#FFFFFF; --surface-2:#EFF2F6;
+  --text:#18202B; --muted:#5C6875; --rule:#E1E6EB; --rule-strong:#C9D2DB;
+  --accent:#B85C15; --accent-soft:#FBEFE2;
+  --ok:#2E7355; --warn:#9A6B18; --danger:#A8322C;
+  --code-bg:#F2F4F7;
+}
+
+*{box-sizing:border-box}
+body{
+  margin:0; background:var(--bg); color:var(--text);
+  font-family:var(--font-prose); font-size:16.5px; line-height:1.65;
+  -webkit-font-smoothing:antialiased;
+}
+a{color:var(--accent); text-underline-offset:2px; text-decoration-thickness:1px}
+a:focus-visible,summary:focus-visible{outline:2px solid var(--accent); outline-offset:3px; border-radius:2px}
+code,kbd,pre,.mono{font-family:var(--font-mono); font-variant-ligatures:none}
+
+/* ---------- masthead ---------- */
+.masthead{
+  border-bottom:1px solid var(--rule); background:var(--surface);
+}
+.masthead-inner{
+  max-width:1180px; margin:0 auto; padding:26px 24px 22px;
+  display:flex; flex-wrap:wrap; gap:18px 28px; align-items:flex-end; justify-content:space-between;
+}
+.brand{display:flex; flex-direction:column; gap:6px}
+.eyebrow{
+  font-family:var(--font-mono); font-size:11px; letter-spacing:.14em;
+  text-transform:uppercase; color:var(--muted);
+}
+.brand h1{
+  font-family:var(--font-display); font-weight:700; letter-spacing:-.022em;
+  font-size:clamp(28px,4.2vw,40px); margin:0; line-height:1.1; text-wrap:balance;
+}
+.brand .sub{font-size:15px; color:var(--muted); max-width:56ch}
+.pillrow{display:flex; flex-wrap:wrap; gap:8px; align-items:center}
+.pill{
+  font-family:var(--font-mono); font-size:12px; padding:4px 10px; border-radius:2px;
+  border:1px solid var(--rule-strong); color:var(--muted); background:var(--surface-2);
+  white-space:nowrap;
+}
+.pill.accent{border-color:var(--accent); color:var(--accent); background:var(--accent-soft)}
+
+/* ---------- shell ---------- */
+.shell{max-width:1180px; margin:0 auto; padding:0 24px; display:grid; gap:44px;
+  grid-template-columns:216px minmax(0,1fr);}
+@media (max-width:980px){ .shell{grid-template-columns:minmax(0,1fr); gap:0} }
+
+nav.toc{position:sticky; top:0; align-self:start; padding:34px 0 60px; max-height:100vh; overflow-y:auto}
+nav.toc h2{
+  font-family:var(--font-mono); font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+  color:var(--muted); margin:0 0 12px; font-weight:400;
+}
+nav.toc ol{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:2px}
+nav.toc a{
+  display:block; padding:4px 10px 4px 11px; font-family:var(--font-display); font-size:13.5px;
+  color:var(--muted); text-decoration:none; border-left:2px solid var(--rule); line-height:1.4;
+}
+nav.toc a:hover{color:var(--text); border-left-color:var(--accent-strong,var(--accent)); background:var(--surface-2)}
+nav.toc li.sub a{padding-left:22px; font-size:12.5px}
+@media (max-width:980px){
+  nav.toc{position:static; max-height:none; padding:20px 0 0}
+  nav.toc ol{display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:2px 16px}
+}
+
+main{padding:34px 0 90px; min-width:0}
+section{padding:0 0 8px; margin:0 0 40px; scroll-margin-top:20px}
+section > :first-child{margin-top:0}
+
+h2.sec{
+  font-family:var(--font-display); font-weight:700; letter-spacing:-.02em;
+  font-size:25px; line-height:1.2; margin:0 0 6px; text-wrap:balance;
+  padding-bottom:10px; border-bottom:2px solid var(--rule-strong);
+}
+h3{
+  font-family:var(--font-display); font-weight:700; letter-spacing:-.012em;
+  font-size:18px; margin:32px 0 8px; text-wrap:balance;
+}
+h4{
+  font-family:var(--font-mono); font-weight:600; font-size:13px; letter-spacing:.02em;
+  margin:22px 0 6px; color:var(--text);
+}
+p{margin:0 0 14px; max-width:72ch}
+ul,ol.prose{margin:0 0 14px; padding-left:22px; max-width:70ch}
+li{margin:0 0 6px}
+strong{font-weight:700}
+.lead{font-size:18px; color:var(--text); max-width:70ch}
+
+/* ---------- code ---------- */
+pre{
+  background:var(--code-bg); border:1px solid var(--rule); border-radius:3px;
+  padding:16px 18px; margin:0 0 18px;
+  font-size:13px; line-height:1.7;
+  /* wrap long lines instead of scrolling sideways; newlines are still honoured */
+  white-space:pre-wrap; overflow-wrap:break-word; tab-size:4;
+}
+/* must reset white-space here: the inline-code rule below would otherwise be
+   inherited and collapse every newline in the block onto one line */
+pre code{background:none; padding:0; border:none; font-size:inherit; white-space:inherit}
+code{
+  background:var(--code-bg); border:1px solid var(--rule); border-radius:2px;
+  padding:.5px 4px; font-size:.86em; white-space:nowrap;
+}
+.c-cm{color:var(--muted); font-style:italic}
+.c-kw{color:var(--accent)}
+
+/* ---------- tables ---------- */
+.tw{overflow-x:auto; margin:0 0 18px; border:1px solid var(--rule); border-radius:3px; background:var(--surface)}
+table{border-collapse:collapse; width:100%; font-family:var(--font-display); font-size:13.5px}
+th,td{text-align:left; padding:9px 13px; border-bottom:1px solid var(--rule); vertical-align:top}
+thead th{
+  font-family:var(--font-mono); font-size:11px; letter-spacing:.09em; text-transform:uppercase;
+  color:var(--muted); font-weight:400; background:var(--surface-2); white-space:nowrap;
+}
+tbody tr:last-child td{border-bottom:none}
+td.mono,th.mono,td code{font-family:var(--font-mono)}
+td.num{font-variant-numeric:tabular-nums; text-align:right; white-space:nowrap}
+td.mono{font-size:12.5px; white-space:nowrap}
+td.desc{font-family:var(--font-prose); font-size:14.5px; line-height:1.5; min-width:260px}
+
+/* ---------- callouts ---------- */
+.note{
+  border-left:3px solid var(--rule-strong); background:var(--surface);
+  padding:13px 16px; margin:0 0 18px; border-radius:0 3px 3px 0;
+}
+.note.warn{border-left-color:var(--warn)}
+.note.danger{border-left-color:var(--danger)}
+.note.ok{border-left-color:var(--ok)}
+.note .tag{
+  font-family:var(--font-mono); font-size:10.5px; letter-spacing:.12em; text-transform:uppercase;
+  display:block; margin-bottom:5px; color:var(--muted);
+}
+.note.warn .tag{color:var(--warn)} .note.danger .tag{color:var(--danger)} .note.ok .tag{color:var(--ok)}
+.note p:last-child{margin-bottom:0}
+
+/* ---------- steps ---------- */
+ol.steps{list-style:none; counter-reset:s; padding:0; margin:0 0 18px; display:flex; flex-direction:column; gap:34px}
+/* exactly two grid children -- the counter and a single wrapper. Letting h4/p/pre
+   be grid items directly makes auto-placement drop every other one into the
+   narrow counter column. */
+ol.steps > li{counter-increment:s; display:grid; grid-template-columns:34px minmax(0,1fr); gap:16px; margin:0}
+ol.steps > li::before{
+  content:counter(s,decimal-leading-zero);
+  font-family:var(--font-mono); font-size:12px; color:var(--accent);
+  padding-top:3px; font-variant-numeric:tabular-nums;
+}
+.step-body{min-width:0}
+.step-body h4{margin:0 0 8px}
+.step-body p{margin:0 0 14px; max-width:68ch}
+.step-body pre{margin:0}
+@media (max-width:560px){
+  ol.steps > li{grid-template-columns:minmax(0,1fr); gap:6px}
+}
+
+/* ---------- api entries ---------- */
+.api{border-top:1px solid var(--rule); padding:16px 0 4px}
+.api:first-of-type{border-top:none}
+.sig{
+  font-family:var(--font-mono); font-size:13px; line-height:1.7; margin:0 0 12px;
+  /* wrap rather than scroll, same as the code blocks; a continued signature is
+     indented so it stays distinguishable from the next declaration */
+  white-space:pre-wrap; overflow-wrap:break-word;
+  padding:2px 0 2px 0; color:var(--text);
+  text-indent:-2ch; padding-left:2ch;
+}
+.sig b{font-weight:600; color:var(--accent)}
+.api p{margin:0 0 10px; font-size:15px}
+
+/* ---------- diagram ---------- */
+figure{margin:0 0 20px; padding:0}
+figure svg{display:block; width:100%; height:auto; max-width:660px}
+figcaption{font-size:13.5px; color:var(--muted); margin-top:8px; max-width:66ch}
+
+/* ---------- footer ---------- */
+footer{border-top:1px solid var(--rule); background:var(--surface); margin-top:20px}
+.footer-inner{
+  max-width:1180px; margin:0 auto; padding:26px 24px 40px;
+  display:flex; flex-wrap:wrap; gap:16px 40px; justify-content:space-between; align-items:flex-start;
+}
+.footer-inner p{font-size:13.5px; color:var(--muted); margin:0; max-width:52ch}
+@media (prefers-reduced-motion:reduce){*{animation:none!important; transition:none!important; scroll-behavior:auto!important}}
+</style>
+
+<header class="masthead">
+  <div class="masthead-inner">
+    <div class="brand">
+      <span class="eyebrow">Tenuvah Designs &middot; Embedded Driver</span>
+      <h1>EMC230X Fan Controller Driver</h1>
+      <p class="sub">A portable C++ driver for the Microchip EMC2301, EMC2302, EMC2303 and EMC2305
+      RPM-based PWM fan controllers.</p>
+    </div>
+    <div class="pillrow">
+      <span class="pill accent">v1.0</span>
+      <span class="pill">C++20</span>
+      <span class="pill">No heap</span>
+      <span class="pill">No exceptions</span>
+      <span class="pill">Transport agnostic</span>
+    </div>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="toc" aria-label="Contents">
+    <h2>Contents</h2>
+    <ol>
+      <li><a href="#overview">Overview</a></li>
+      <li><a href="#devices">Supported devices</a></li>
+      <li><a href="#quickstart">Quick start</a></li>
+      <li><a href="#transport">SMBus transport</a></li>
+      <li><a href="#status">Status &amp; errors</a></li>
+      <li><a href="#tach">Tach counts &amp; RPM</a></li>
+      <li class="sub"><a href="#justify">Register justification</a></li>
+      <li class="sub"><a href="#poles">Poles vs. pulses</a></li>
+      <li class="sub"><a href="#range">Range selection</a></li>
+      <li><a href="#modes">Control modes</a></li>
+      <li><a href="#api">API reference</a></li>
+      <li class="sub"><a href="#api-setup">Setup</a></li>
+      <li class="sub"><a href="#api-ident">Identification</a></li>
+      <li class="sub"><a href="#api-get">State getters</a></li>
+      <li class="sub"><a href="#api-set">Per-fan setters</a></li>
+      <li class="sub"><a href="#api-rpm">Tach &amp; RPM</a></li>
+      <li class="sub"><a href="#api-high">High level</a></li>
+      <li><a href="#types">Types</a></li>
+      <li><a href="#example">Worked example</a></li>
+      <li><a href="#pitfalls">Pitfalls</a></li>
+      <li><a href="#refs">References</a></li>
+    </ol>
+  </nav>
+
+  <main>
+
+  <section id="overview">
+    <h2 class="sec">Overview</h2>
+    <p class="lead">One driver for the whole EMC230x family. It identifies the part from its
+    product ID, touches only the fan channels that part implements, and speaks RPM rather than
+    raw tachometer counts.</p>
+
+    <p>The driver performs no platform calls of its own. You supply two function pointers &mdash;
+    an SMBus register read and an SMBus register write &mdash; and everything else is portable
+    C++. There is no dynamic allocation, no exceptions, no RTTI, and no dependency beyond
+    <code>&lt;stdint.h&gt;</code> and <code>&lt;stdbool.h&gt;</code>.</p>
+
+    <h3>What it handles for you</h3>
+    <ul>
+      <li><strong>Device detection.</strong> The product ID is read once on first use and the
+      per-fan register accesses are masked to the channels that exist. Registers belonging to an
+      absent fan are reserved, and reading them is a real source of trouble on the smaller parts.</li>
+      <li><strong>Tachometer arithmetic.</strong> The 13-bit count, its register justification and
+      the RPM conversion are all internal. You pass and receive RPM.</li>
+      <li><strong>Error reporting.</strong> Every operation returns a status. A missing transport,
+      a bad argument and a bus failure are distinguishable, and none of them are fatal.</li>
+      <li><strong>Cached state.</strong> Each getter refreshes an internal mirror of the device
+      registers, readable through <code>getCachedState()</code>.</li>
+    </ul>
+
+    <h3>What it deliberately leaves to you</h3>
+    <ul>
+      <li>The I&sup2;C/SMBus implementation, including timeouts and bus recovery.</li>
+      <li>Thread safety. The driver holds mutable cached state and is not re-entrant; serialise
+      access yourself if more than one context uses it.</li>
+      <li>Any policy above the chip &mdash; thermal curves, fault escalation, hysteresis.</li>
+    </ul>
+  </section>
+
+  <section id="devices">
+    <h2 class="sec">Supported devices</h2>
+    <p>All four parts share one register map; they differ only in how many fan channels are
+    populated. The driver reads the product ID and builds a channel mask from it.</p>
+    <div class="tw">
+      <table>
+        <thead>
+          <tr><th>Device</th><th>Fans</th><th>Product ID</th><th class="mono">getAvailableFans()</th><th>Enumerator</th></tr>
+        </thead>
+        <tbody>
+          <tr><td class="mono">EMC2301</td><td class="num">1</td><td class="mono">0x37</td><td class="mono">0x01</td><td class="mono">EMC2301_ID</td></tr>
+          <tr><td class="mono">EMC2302</td><td class="num">2</td><td class="mono">0x36</td><td class="mono">0x03</td><td class="mono">EMC2302_ID</td></tr>
+          <tr><td class="mono">EMC2303</td><td class="num">3</td><td class="mono">0x35</td><td class="mono">0x07</td><td class="mono">EMC2303_ID</td></tr>
+          <tr><td class="mono">EMC2305</td><td class="num">5</td><td class="mono">0x34</td><td class="mono">0x1F</td><td class="mono">EMC2305_ID</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The manufacturer ID register always reads <code>0x5D</code>. Checking it is the cheapest way
+    to confirm you are talking to the part at all rather than to a floating bus.</p>
+    <div class="note">
+      <span class="tag">Default address</span>
+      <p>The SMBus address is <code>0x2F</code> on the EMC2301 and EMC2302. The EMC2303 and EMC2305
+      have an <code>ADDR_SEL</code> pin and can sit elsewhere &mdash; pass the real address to
+      <code>setI2CDriver()</code>, which the driver uses for every transaction.</p>
+    </div>
+  </section>
+
+  <section id="quickstart">
+    <h2 class="sec">Quick start</h2>
+    <p>Four steps from a blank project to a fan turning at a commanded speed.</p>
+    <ol class="steps">
+      <li>
+        <div class="step-body">        <h4>Provide the transport</h4>
+        <p>Two free functions wrapping your platform's SMBus register access. Return
+        <code>0</code> on success and anything non-zero on failure.</p>
+<pre><code>int smbus_read(uint16_t addr, uint8_t cmd, uint8_t *data, uint8_t len)
+{
+    return (int) HAL_I2C_Mem_Read(&amp;hi2c2, (addr &lt;&lt; 1), cmd,
+                                  I2C_MEMADD_SIZE_8BIT, data, len, 100);
+}
+
+int smbus_write(uint16_t addr, uint8_t cmd, uint8_t *data, uint8_t len)
+{
+    return (int) HAL_I2C_Mem_Write(&amp;hi2c2, (addr &lt;&lt; 1), cmd,
+                                   I2C_MEMADD_SIZE_8BIT, data, len, 100);
+}</code></pre></div>
+      </li>
+      <li>
+        <div class="step-body">        <h4>Install it</h4>
+        <p>The address you pass here is used for every subsequent transaction.</p>
+<pre><code>EMC230X::EMC230X fan;
+fan.setI2CDriver(0x2F, smbus_write, smbus_read);</code></pre></div>
+      </li>
+      <li>
+        <div class="step-body">        <h4>Confirm the device</h4>
+        <p>Optional &mdash; the bulk getters identify the part themselves on first use &mdash; but
+        doing it explicitly gives you somewhere to handle a wiring fault.</p>
+<pre><code>if (fan.getChipInfo() != EMC230X::EMC230X_STATUS_OK ||
+    fan.getManufacturerID() != EMC230X::MICROCHIP_MANUFACTURER)
+{
+    // nothing on the bus at this address
+}</code></pre></div>
+      </li>
+      <li>
+        <div class="step-body">        <h4>Command a speed and read it back</h4>
+        <p><code>runControlAlgorithm()</code> configures closed-loop control and sets the target
+        in one call. Pass <code>0</code> to park the fan.</p>
+<pre><code>fan.runControlAlgorithm(EMC230X::FANCNTRL_1, 2000);   <span class="c-cm">// 2000 RPM</span>
+
+uint16_t rpm = 0;
+fan.getFanTachReading();                              <span class="c-cm">// refresh the cache</span>
+fan.getFanRPMReading(EMC230X::FANCNTRL_1, &amp;rpm);</code></pre></div>
+      </li>
+    </ol>
+  </section>
+
+  <section id="transport">
+    <h2 class="sec">SMBus transport</h2>
+    <p>The driver calls out through two function pointers with identical signatures:</p>
+<pre><code>typedef int (*smbus_write_register)(uint16_t addr, uint8_t cmd, uint8_t *data, uint8_t len);
+typedef int (*smbus_read_register) (uint16_t addr, uint8_t cmd, uint8_t *data, uint8_t len);</code></pre>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Parameter</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">addr</td><td class="desc">The device's 7-bit SMBus address, exactly as passed to <code>setI2CDriver()</code>. Shift it left yourself if your HAL expects an 8-bit address.</td></tr>
+          <tr><td class="mono">cmd</td><td class="desc">Register address (the SMBus command code).</td></tr>
+          <tr><td class="mono">data</td><td class="desc">Buffer to fill or send.</td></tr>
+          <tr><td class="mono">len</td><td class="desc">Byte count. The driver only ever asks for one byte at a time; multi-byte registers are read as two separate single-byte transactions in the order the datasheet requires.</td></tr>
+          <tr><td class="mono">return</td><td class="desc"><code>0</code> for success, non-zero for failure. The value is not interpreted &mdash; any non-zero result becomes <code>EMC230X_STATUS_FAIL</code>.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note warn">
+      <span class="tag">Blocking calls</span>
+      <p>Every driver call is synchronous and runs to completion on your transport. A full
+      <code>getChipState()</code> is on the order of a hundred transactions on a five-fan part.
+      Call it during initialisation or on a slow cadence, not from a tight control loop.</p>
+    </div>
+  </section>
+
+  <section id="status">
+    <h2 class="sec">Status &amp; errors</h2>
+    <p>Every operation that can fail returns <code>EMC230X_STATUS</code>. The values are
+    <strong>bit flags</strong>, not an ordered list.</p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Value</th><th>Bit</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">EMC230X_STATUS_OK</td><td class="mono">0</td><td class="desc">Success.</td></tr>
+          <tr><td class="mono">EMC230X_STATUS_FAIL</td><td class="mono">0x01</td><td class="desc">An SMBus read or write returned non-zero.</td></tr>
+          <tr><td class="mono">EMC230X_STATUS_INVALIDARG</td><td class="mono">0x02</td><td class="desc">A fan selector that is not exactly one channel, or a null out-pointer.</td></tr>
+          <tr><td class="mono">EMC230X_SMBUS_DRIVER_NULL</td><td class="mono">0x04</td><td class="desc"><code>setI2CDriver()</code> has not been called.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note danger">
+      <span class="tag">Never test with ==</span>
+      <p><code>getChipState()</code> ORs together the result of every read it performs, so it can
+      return <code>3</code>, <code>5</code>, <code>6</code> or <code>7</code> &mdash; values that
+      match no single enumerator. Test <code>== EMC230X_STATUS_OK</code> for "everything
+      succeeded", or use <code>&amp;</code> to isolate one cause. Comparing
+      <code>== EMC230X_STATUS_FAIL</code> will silently miss combined failures.</p>
+    </div>
+<pre><code><span class="c-cm">// correct</span>
+if (fan.getChipState() != EMC230X::EMC230X_STATUS_OK) { <span class="c-cm">/* something failed */</span> }
+if (st &amp; EMC230X::EMC230X_SMBUS_DRIVER_NULL)          { <span class="c-cm">/* transport missing */</span> }
+
+<span class="c-cm">// wrong -- misses 3, 5, 7</span>
+if (st == EMC230X::EMC230X_STATUS_FAIL) { }</code></pre>
+  </section>
+
+  <section id="tach">
+    <h2 class="sec">Tach counts &amp; RPM</h2>
+    <p>The device does not report speed. It reports the number of 32.768&nbsp;kHz clock periods
+    that elapse across a fixed number of tachometer edges &mdash; a period, not a frequency. Speed
+    is the reciprocal, which is why a <em>slower</em> fan produces a <em>larger</em> count.</p>
+
+    <h3>The conversion</h3>
+    <p>Datasheet equation 4-2 in full:</p>
+<pre><code>              1        (n - 1)
+RPM  =  ───────────  ×  ─────────────  ×  f_TACH  ×  60
+           poles        COUNT × (1/m)</code></pre>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Term</th><th>Meaning</th><th>Typical</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">poles</td><td class="desc">Tachometer pulses per revolution.</td><td class="mono">2</td></tr>
+          <tr><td class="mono">n</td><td class="desc">Edges sampled. Must equal <code>2 × poles + 1</code>.</td><td class="mono">5</td></tr>
+          <tr><td class="mono">m</td><td class="desc">Range multiplier, from the <code>RNG</code> field.</td><td class="mono">1</td></tr>
+          <tr><td class="mono">f_TACH</td><td class="desc">Tachometer clock.</td><td class="mono">32768 Hz</td></tr>
+          <tr><td class="mono">COUNT</td><td class="desc">The 13-bit value in the TACH reading register.</td><td class="mono">—</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>For a standard 4-wire fan at multiplier 1 this collapses to equation 4-3, which is what the
+    driver implements:</p>
+<pre><code>RPM = 3932160 / COUNT          COUNT = 3932160 / RPM</code></pre>
+    <div class="tw">
+      <table>
+        <thead><tr><th>RPM</th><th>Count</th><th>High byte</th><th>Low byte</th></tr></thead>
+        <tbody>
+          <tr><td class="num">5000</td><td class="num mono">786</td><td class="mono">0x18</td><td class="mono">0x90</td></tr>
+          <tr><td class="num">4000</td><td class="num mono">983</td><td class="mono">0x1E</td><td class="mono">0xB8</td></tr>
+          <tr><td class="num">3000</td><td class="num mono">1310</td><td class="mono">0x28</td><td class="mono">0xF0</td></tr>
+          <tr><td class="num">2000</td><td class="num mono">1966</td><td class="mono">0x3D</td><td class="mono">0x70</td></tr>
+          <tr><td class="num">1500</td><td class="num mono">2621</td><td class="mono">0x51</td><td class="mono">0xE8</td></tr>
+          <tr><td class="num">1000</td><td class="num mono">3932</td><td class="mono">0x7A</td><td class="mono">0xE0</td></tr>
+          <tr><td class="num">480</td><td class="num mono">8191</td><td class="mono">0xFF</td><td class="mono">0xF8</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>The count saturates at <code>0x1FFF</code>. At multiplier 1 that corresponds to roughly
+    <strong>480&nbsp;RPM</strong>, which is the slowest speed the device can measure &mdash; the
+    figure the datasheet quotes as the bottom of its 480&ndash;16000&nbsp;RPM tachometer range.
+    Anything slower, including a stopped fan, pins there.</p>
+
+    <h3 id="justify">Register justification</h3>
+    <p>The 13-bit count is <strong>left-justified</strong> across its two registers. The low byte
+    carries the least significant five bits in positions 7:3, and bits 2:0 are unimplemented.</p>
+    <figure>
+      <svg viewBox="0 0 660 152" role="img" aria-label="Diagram showing the 13-bit tach count occupying bits 15 down to 3 of the register pair, with the low three bits unimplemented.">
+        <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10">
+          <text x="0" y="12" fill="currentColor" opacity=".6">HIGH BYTE (e.g. 0x3E)</text>
+          <text x="340" y="12" fill="currentColor" opacity=".6">LOW BYTE (e.g. 0x3F)</text>
+          <g>
+            <rect x="0" y="22" width="320" height="34" fill="none" stroke="currentColor" stroke-opacity=".35"/>
+            <rect x="320" y="22" width="200" height="34" fill="var(--accent-soft)" stroke="currentColor" stroke-opacity=".35"/>
+            <rect x="520" y="22" width="120" height="34" fill="none" stroke="currentColor" stroke-opacity=".35" stroke-dasharray="3 3"/>
+            <line x1="320" y1="22" x2="320" y2="56" stroke="currentColor" stroke-opacity=".5"/>
+            <text x="160" y="43" text-anchor="middle" fill="currentColor">COUNT[12:5]</text>
+            <text x="420" y="43" text-anchor="middle" fill="var(--accent)">COUNT[4:0]</text>
+            <text x="580" y="43" text-anchor="middle" fill="currentColor" opacity=".45">unimpl.</text>
+          </g>
+          <g fill="currentColor" opacity=".5" font-size="9">
+            <text x="4" y="68">bit 15</text>
+            <text x="292" y="68">bit 8</text>
+            <text x="324" y="68">bit 7</text>
+            <text x="500" y="68">bit 3</text>
+            <text x="608" y="68">bit 0</text>
+          </g>
+          <g>
+            <line x1="330" y1="88" x2="330" y2="106" stroke="var(--accent)" stroke-opacity=".8"/>
+            <path d="M330 106 l-4 -6 h8 z" fill="var(--accent)"/>
+            <text x="344" y="104" fill="var(--accent)">shift right 3 on read &nbsp;· &nbsp;shift left 3 on write</text>
+          </g>
+          <g>
+            <rect x="0" y="116" width="500" height="30" fill="none" stroke="currentColor" stroke-opacity=".35"/>
+            <text x="250" y="135" text-anchor="middle" fill="currentColor">COUNT[12:0] &nbsp;— the value the API works in</text>
+          </g>
+        </g>
+      </svg>
+      <figcaption>The same layout applies to the TACH Reading and TACH Target register pairs. The
+      driver handles the shift internally; every count crossing the API is already justified.</figcaption>
+    </figure>
+    <div class="note warn">
+      <span class="tag">If you extend the driver</span>
+      <p>Keep the shift welded to the byte assembly for each fan. Applying it after reading all
+      channels means a transport failure part-way through leaves the fans already read scaled by a
+      factor of eight &mdash; a wrong speed rather than an error.</p>
+    </div>
+
+    <h3 id="poles">Poles versus pulses</h3>
+    <p>The datasheet's word "poles" means <strong>tachometer pulses per revolution</strong>, not
+    the motor's magnetic pole count. A standard 4-wire fan emits two pulses per revolution and is
+    therefore a "2-pole" fan in the device's vocabulary &mdash; regardless of how many magnetic
+    poles the motor has. Most 40&nbsp;mm fans are 4-pole motors emitting 2 pulses/rev, and the
+    correct setting for them is <code>FANPOLE_2</code>.</p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Enumerator</th><th>Value</th><th>Pulses/rev</th><th>Edges sampled</th><th></th></tr></thead>
+        <tbody>
+          <tr><td class="mono">FANPOLE_1</td><td class="mono">0</td><td class="num">1</td><td class="num">3</td><td class="desc"></td></tr>
+          <tr><td class="mono">FANPOLE_2</td><td class="mono">1</td><td class="num">2</td><td class="num">5</td><td class="desc">Standard 4-wire fan. Device reset default.</td></tr>
+          <tr><td class="mono">FANPOLE_3</td><td class="mono">2</td><td class="num">3</td><td class="num">7</td><td class="desc"></td></tr>
+          <tr><td class="mono">FANPOLE_4</td><td class="mono">3</td><td class="num">4</td><td class="num">9</td><td class="desc"></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note danger">
+      <span class="tag">Common mistake</span>
+      <p>Selecting <code>FANPOLE_4</code> because the datasheet for a 4-pole motor says "4 poles"
+      makes every reading half the true speed. The edges sampled must satisfy
+      <code>n = 2 × poles + 1</code>; with a 2-pulse/rev fan and 9 edges the device measures four
+      revolutions but assumes two.</p>
+    </div>
+
+    <h3 id="range">Range selection</h3>
+    <p>The <code>FRNG</code> field trades measurement resolution against the slowest speed that
+    fits in 13 bits.</p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>FRNG</th><th>Multiplier</th><th>Nominal minimum</th><th>Slowest measurable</th><th>Resolution @ 5000 RPM</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">00</td><td class="num">×1</td><td class="num">500 RPM</td><td class="num">480 RPM</td><td class="num">≈ ±6 RPM</td></tr>
+          <tr><td class="mono">01</td><td class="num">×2</td><td class="num">1000 RPM</td><td class="num">960 RPM</td><td class="num">≈ ±3 RPM</td></tr>
+          <tr><td class="mono">10</td><td class="num">×4</td><td class="num">2000 RPM</td><td class="num">1920 RPM</td><td class="num">≈ ±1.5 RPM</td></tr>
+          <tr><td class="mono">11</td><td class="num">×8</td><td class="num">4000 RPM</td><td class="num">3840 RPM</td><td class="num">≈ ±0.8 RPM</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>Microchip's guidance is to pick the largest range below your fan's minimum speed. In
+    practice the error window (<code>ERG</code>, typically 50&nbsp;RPM) is far wider than the
+    quantisation at any setting, so resolution is rarely the binding constraint. Dropping below the
+    slowest measurable speed is: the count overflows and the device reports a <em>stall</em>,
+    triggering spin-up retries. <code>FRNG = 00</code> is the safe default unless you have a
+    specific reason otherwise.</p>
+  </section>
+
+  <section id="modes">
+    <h2 class="sec">Control modes</h2>
+    <p>Each fan channel is independently in one of two modes, selected by the <code>ENAG</code> bit
+    via <code>toggleControlAlgorithm()</code>.</p>
+    <div class="tw">
+      <table>
+        <thead><tr><th></th><th>Closed loop (ENAG = 1)</th><th>Direct setting (ENAG = 0)</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">You set</td><td class="desc">A target tachometer count &mdash; i.e. a speed.</td><td class="desc">A PWM duty cycle, 0&ndash;255.</td></tr>
+          <tr><td class="mono">Device does</td><td class="desc">Runs a PID loop against the measured tach, correcting for load, voltage and fan ageing.</td><td class="desc">Nothing. The duty is applied as given.</td></tr>
+          <tr><td class="mono">Drive register</td><td class="desc">Read-only. Writes are ignored.</td><td class="desc">Writable via <code>setFanDriveSettings()</code>.</td></tr>
+          <tr><td class="mono">Ramp control</td><td class="desc">Always active, governed by max step and update time.</td><td class="desc">Only if <code>ENRC</code> is set.</td></tr>
+          <tr><td class="mono">Use when</td><td class="desc">You want a speed held accurately.</td><td class="desc">You want a duty cycle, or the fan has no usable tach.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">
+      <span class="tag">Stopping a fan</span>
+      <p>In closed loop, writing a target of <code>0x1FFF</code> &mdash; which is what
+      <code>runControlAlgorithm(fan, 0)</code> does &mdash; drives the output to 0%. Any other
+      target restarts the spin-up routine.</p>
+    </div>
+  </section>
+
+  <section id="api">
+    <h2 class="sec">API reference</h2>
+    <p>All types live in namespace <code>EMC230X</code>. Functions returning
+    <code>EMC230X_STATUS</code> report <code>EMC230X_SMBUS_DRIVER_NULL</code> if no transport has
+    been installed, and <code>EMC230X_STATUS_INVALIDARG</code> if the fan selector is not exactly
+    one channel.</p>
+
+    <h3 id="api-setup">Setup</h3>
+    <div class="api">
+      <p class="sig">EMC230X();
+EMC230X(uint8_t addr, smbus_write_register write_func, smbus_read_register read_func);</p>
+      <p>The default constructor initialises the cache only &mdash; no bus activity occurs, and none
+      will until a transport is installed.</p>
+    </div>
+    <div class="api">
+      <p class="sig">void <b>setI2CDriver</b>(uint8_t addr, smbus_write_register write_func, smbus_read_register read_func);</p>
+      <p>Installs the transport and the device address. Must be called before anything else. The
+      address given here is used for every transaction.</p>
+    </div>
+
+    <h3 id="api-ident">Identification</h3>
+    <div class="api">
+      <p class="sig">EMC230X_STATUS <b>getChipInfo</b>();</p>
+      <p>Reads the product features, product ID, manufacturer ID and revision registers, and builds
+      the available-fan mask. Called automatically by the bulk getters on first use.</p>
+    </div>
+    <div class="api">
+      <p class="sig">EMC230X_PRODUCTID      <b>getChipID</b>();
+EMC230X_MANUFACTURERID <b>getManufacturerID</b>();
+uint8_t                <b>getChipRev</b>();
+uint8_t                <b>getProductFeatures</b>();
+uint8_t                <b>getAvailableFans</b>();</p>
+      <p>Cached accessors, valid after <code>getChipInfo()</code>. No bus activity.
+      <code>getAvailableFans()</code> returns a bit mask of <code>EMC230X_FAN</code> values.</p>
+    </div>
+    <div class="api">
+      <p class="sig">const sEMC230X_State &amp;<b>getCachedState</b>() const;</p>
+      <p>Read-only view of every register value the getters have cached. Freshness is entirely
+      determined by which getters you have called.</p>
+      <div class="note warn">
+        <span class="tag">Packed struct</span>
+        <p><code>sEMC230X_State</code> is declared <code>packed</code>. Read its 16-bit members by
+        value; taking their address can yield an unaligned pointer, and an unaligned 16-bit access
+        faults on Cortex-M0/M0+.</p>
+      </div>
+    </div>
+
+    <h3 id="api-get">State getters</h3>
+    <p>Each refreshes its part of the cache from the device. Those marked <em>per-fan</em> read the
+    registers of every implemented channel and identify the part first if needed.</p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Function</th><th>Reads</th><th>Per-fan</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">getChipState()</td><td class="desc">Every getter below, ORing the results.</td><td>—</td></tr>
+          <tr><td class="mono">getChipConfig()</td><td class="desc">Configuration register.</td><td>—</td></tr>
+          <tr><td class="mono">getSoftWareLock()</td><td class="desc">Software lock. When set, all writes are ignored until a power cycle.</td><td>—</td></tr>
+          <tr><td class="mono">getFanStatus()</td><td class="desc">Roll-up status: stall, spin, drive-fail, watchdog.</td><td>—</td></tr>
+          <tr><td class="mono">getFanStallStatus()</td><td class="desc">Per-fan stall flags.</td><td>—</td></tr>
+          <tr><td class="mono">getFanSpinStatus()</td><td class="desc">Per-fan spin-up failure flags.</td><td>—</td></tr>
+          <tr><td class="mono">getDriveFailStatus()</td><td class="desc">Per-fan drive-fail flags.</td><td>—</td></tr>
+          <tr><td class="mono">getFanInterruptEnable()</td><td class="desc">Which fans may assert ALERT.</td><td>—</td></tr>
+          <tr><td class="mono">getPWMPolarity()</td><td class="desc">Output polarity per fan.</td><td>—</td></tr>
+          <tr><td class="mono">getPWMOutput()</td><td class="desc">Push-pull or open drain per fan.</td><td>—</td></tr>
+          <tr><td class="mono">getPWMBaseFreq()</td><td class="desc">Base frequency for all channels.</td><td>—</td></tr>
+          <tr><td class="mono">getPWMDivider()</td><td class="desc">Frequency divider.</td><td>yes</td></tr>
+          <tr><td class="mono">getFanDriveSettings()</td><td class="desc">Current PWM duty.</td><td>yes</td></tr>
+          <tr><td class="mono">getFanConfig1()</td><td class="desc">ENAG, RNG, EDG, UDT.</td><td>yes</td></tr>
+          <tr><td class="mono">getFanConfig2()</td><td class="desc">ENRC, GHEN, DPT, ERG.</td><td>yes</td></tr>
+          <tr><td class="mono">getPIDGain()</td><td class="desc">Proportional, integral, derivative gains.</td><td>yes</td></tr>
+          <tr><td class="mono">getFanSpinUpConfig()</td><td class="desc">Spin-up level, time, kick, drive-fail count.</td><td>yes</td></tr>
+          <tr><td class="mono">getFanMaxStep()</td><td class="desc">Ramp rate limit.</td><td>yes</td></tr>
+          <tr><td class="mono">getFanMinDrive()</td><td class="desc">Minimum duty the loop will command.</td><td>yes</td></tr>
+          <tr><td class="mono">getFanValidTachCount()</td><td class="desc">Stall threshold.</td><td>yes</td></tr>
+          <tr><td class="mono">getDriveFailBand()</td><td class="desc">Drive-fail detection window.</td><td>yes</td></tr>
+          <tr><td class="mono">getFanTachTarget()</td><td class="desc">Commanded tach counts.</td><td>yes</td></tr>
+          <tr><td class="mono">getFanTachReading()</td><td class="desc">Measured tach counts.</td><td>yes</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 id="api-set">Per-fan setters</h3>
+    <p>All take an <code>EMC230X_FAN</code> selecting exactly one channel. Each is a
+    read-modify-write: it refreshes the cache, applies the change and writes the register back, so
+    a failed read aborts before anything is written.</p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Function</th><th>Argument</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">setFanDriveSettings()</td><td class="mono">uint8_t speed</td><td class="desc">PWM duty, 0&ndash;255. Ignored while closed-loop control is enabled.</td></tr>
+          <tr><td class="mono">setFanTachTarget()</td><td class="mono">uint16_t tach</td><td class="desc">Target count, not RPM. Use <code>rpmToTachCount()</code>.</td></tr>
+          <tr><td class="mono">setFanConfig1()</td><td class="mono">EMC230X_FanConfig1</td><td class="desc">ENAG, RNG, EDG, UDT in one write.</td></tr>
+          <tr><td class="mono">setFanConfig2()</td><td class="mono">EMC230X_FanConfig2</td><td class="desc">ENRC, GHEN, DPT, ERG.</td></tr>
+          <tr><td class="mono">setPIDGain()</td><td class="mono">EMC230X_PIDGain</td><td class="desc">Gains are multipliers of 1×, 2×, 4×, 8×.</td></tr>
+          <tr><td class="mono">setFanSpinUpConfig()</td><td class="mono">EMC230X_FanSpinUpConfig</td><td class="desc">Level, duration, kick, drive-fail count.</td></tr>
+          <tr><td class="mono">setFanMaxStep()</td><td class="mono">uint8_t maxstep</td><td class="desc">Documented range 1&ndash;31 counts per update.</td></tr>
+          <tr><td class="mono">setFanMinDrive()</td><td class="mono">uint8_t minstep</td><td class="desc">Keep above the duty at which your fan stalls. Reset default is 0x66 (40%).</td></tr>
+          <tr><td class="mono">setFanValidTachCount()</td><td class="mono">uint8_t count</td><td class="desc">Compared against the reading's high byte; effective threshold is <code>count × 32</code>.</td></tr>
+          <tr><td class="mono">setDriveFailBand()</td><td class="mono">uint16_t fail</td><td class="desc">Tach counts of tolerance before a drive fault is flagged.</td></tr>
+          <tr><td class="mono">setFanPoles()</td><td class="mono">EMC230X_FANPOLES</td><td class="desc">Sets the EDG field and the internal multiplier together.</td></tr>
+          <tr><td class="mono">setPWMPolarity()</td><td class="mono">uint8_t polarity</td><td class="desc">0 = normal (00h is 0% duty), 1 = inverted.</td></tr>
+          <tr><td class="mono">setPWMOutput()</td><td class="mono">uint8_t iotype</td><td class="desc">0 = open drain, 1 = push-pull. Open drain suits 4-wire fans, which pull the line up internally.</td></tr>
+          <tr><td class="mono">setPWMBaseFreq()</td><td class="mono">EMC230X_PWMFREQ</td><td class="desc">Use 26 kHz for 4-wire fans; the Intel specification calls for 21&ndash;28 kHz.</td></tr>
+          <tr><td class="mono">setPWMDivider()</td><td class="mono">uint8_t divider</td><td class="desc">Divides the base frequency. 1 = undivided.</td></tr>
+          <tr><td class="mono">setFanInterrupt()</td><td class="mono">bool enabled</td><td class="desc">Whether this fan may assert ALERT.</td></tr>
+          <tr><td class="mono">toggleControlAlgorithm()</td><td class="mono">bool enable</td><td class="desc">Closed loop on or off.</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3 id="api-rpm">Tach &amp; RPM</h3>
+    <div class="api">
+      <p class="sig">EMC230X_STATUS <b>getFanRPMReading</b>(EMC230X_FAN fan, uint16_t *rpm);
+EMC230X_STATUS <b>getFanRPM</b>       (EMC230X_FAN fan, uint16_t *rpm);</p>
+      <p>Both report speed through <code>rpm</code> and the outcome through the return value, so a
+      stopped fan stays distinguishable from a failed read:</p>
+      <div class="tw">
+        <table>
+          <thead><tr><th>Return</th><th>*rpm</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td class="mono">OK</td><td class="mono">&gt; 0</td><td class="desc">Measured speed.</td></tr>
+            <tr><td class="mono">OK</td><td class="mono">0</td><td class="desc">Count at full scale &mdash; the fan is stopped or disconnected.</td></tr>
+            <tr><td class="mono">FAIL</td><td class="mono">0</td><td class="desc">The cache was never populated, or a read failed.</td></tr>
+            <tr><td class="mono">INVALIDARG</td><td class="mono">0</td><td class="desc">Bad fan selector, or a null pointer.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><code>getFanRPMReading()</code> is integer arithmetic over the cached count and performs
+      <strong>no bus traffic</strong> &mdash; call <code>getFanTachReading()</code> first to
+      refresh. <code>getFanRPM()</code> is the floating-point equivalent and re-reads configuration
+      and all tach registers on every call, roughly fifteen transactions. Prefer the former in a
+      control loop; the two agree to within one RPM.</p>
+    </div>
+    <div class="api">
+      <p class="sig">uint16_t <b>getFanTachReading</b>(EMC230X_FAN fan);
+uint16_t <b>rpmToTachCount</b>(uint16_t rpm);
+EMC230X_FANPOLES <b>getFanPoles</b>(EMC230X_FAN fan);</p>
+      <p>Cached accessors and the conversion helper. <code>rpmToTachCount()</code> returns
+      <code>0x1FFF</code> for 0&nbsp;RPM (fan off) and clamps anything below the measurable
+      minimum.</p>
+    </div>
+
+    <h3 id="api-high">High level</h3>
+    <div class="api">
+      <p class="sig">void <b>runControlAlgorithm</b>(EMC230X_FAN fan, uint16_t targetRPM);</p>
+      <p>Configures a channel for closed-loop control and commands a speed, in one call. Applies a
+      complete working configuration for a standard 4-wire fan: 2 pulses/rev, range multiplier 1,
+      400&nbsp;ms update interval, 50&nbsp;RPM error window, basic derivative, glitch filter on,
+      open-drain output at 26&nbsp;kHz. Pass <code>targetRPM = 0</code> to park the fan.</p>
+      <p>Speeds below the measurable minimum are clamped. This is a convenience wrapper &mdash; for
+      anything unusual, drive the individual setters yourself.</p>
+    </div>
+  </section>
+
+  <section id="types">
+    <h2 class="sec">Types</h2>
+    <p>The register unions each overlay a named bit-field struct on a single byte, so you can work
+    with fields or with the raw value interchangeably.</p>
+<pre><code>EMC230X_FanConfig1 cfg = {0};
+cfg.UDT  = 3;   <span class="c-cm">// 400 ms PID update</span>
+cfg.EDG  = 1;   <span class="c-cm">// 5 edges = 2 pulses/rev</span>
+cfg.FRNG = 0;   <span class="c-cm">// range multiplier 1</span>
+cfg.ENAG = 1;   <span class="c-cm">// closed loop</span>
+<span class="c-cm">// cfg.fanConfig1 == 0x8B</span></code></pre>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Type</th><th>Fields</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">EMC230X_Configuration</td><td class="desc">USECK, DRECK, WD_EN, DIS_TO, MASK</td></tr>
+          <tr><td class="mono">EMC230X_FanStatus</td><td class="desc">FNSTL, FNSPIN, DVFAIL, WATCH</td></tr>
+          <tr><td class="mono">EMC230X_FanStallStatus</td><td class="desc">F1STL &hellip; F5STL</td></tr>
+          <tr><td class="mono">EMC230X_FanSpinStatus</td><td class="desc">F1SPIN &hellip; F5SPIN</td></tr>
+          <tr><td class="mono">EMC230X_DriveFailStatus</td><td class="desc">F1DRV &hellip; F5DRV</td></tr>
+          <tr><td class="mono">EMC230X_FanInterruptEnable</td><td class="desc">F1ITEN &hellip; F5ITEN</td></tr>
+          <tr><td class="mono">EMC230X_PWMPolarity</td><td class="desc">POLARITY1 &hellip; POLARITY5</td></tr>
+          <tr><td class="mono">EMC230X_PWMOutputConfig</td><td class="desc">PWMOUT1 &hellip; PWMOUT5</td></tr>
+          <tr><td class="mono">EMC230X_FanConfig1</td><td class="desc">UDT (update time), EDG (edges), FRNG (range), ENAG (closed loop)</td></tr>
+          <tr><td class="mono">EMC230X_FanConfig2</td><td class="desc">ERG (error window), DPT (derivative), GHEN (glitch filter), ENRC (ramp control)</td></tr>
+          <tr><td class="mono">EMC230X_PIDGain</td><td class="desc">GPR, GIN, GDE</td></tr>
+          <tr><td class="mono">EMC230X_FanSpinUpConfig</td><td class="desc">SPT (time), SPLV (level), NKCK (no kick), DFC (drive-fail count)</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <h4>EMC230X_PWMFREQ</h4>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Enumerator</th><th>Value</th><th>Base frequency</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">FREQ_26KHZ</td><td class="mono">0</td><td class="num">26.00 kHz</td></tr>
+          <tr><td class="mono">FREQ_19_53KHZ</td><td class="mono">1</td><td class="num">19.53 kHz</td></tr>
+          <tr><td class="mono">FREQ_4_882KHZ</td><td class="mono">2</td><td class="num">4.882 kHz</td></tr>
+          <tr><td class="mono">FREQ_2_441KHZ</td><td class="mono">3</td><td class="num">2.441 kHz</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="example">
+    <h2 class="sec">Worked example</h2>
+    <p>A 40&nbsp;mm 4-wire fan &mdash; 5000&nbsp;RPM maximum, 2 tachometer pulses per revolution,
+    stopping at 0% PWM &mdash; under closed-loop control.</p>
+<pre><code>EMC230X::EMC230X fan;
+fan.setI2CDriver(0x2F, smbus_write, smbus_read);
+
+if (fan.getChipInfo() != EMC230X::EMC230X_STATUS_OK ||
+    fan.getManufacturerID() != EMC230X::MICROCHIP_MANUFACTURER)
+{
+    return; <span class="c-cm">// no device on the bus</span>
+}
+
+<span class="c-cm">// One call applies a complete working configuration and the target.</span>
+fan.runControlAlgorithm(EMC230X::FANCNTRL_1, 2000);
+
+<span class="c-cm">// Later, in the control loop -- one bus burst, then arithmetic only.</span>
+if (fan.getFanTachReading() == EMC230X::EMC230X_STATUS_OK)
+{
+    uint16_t rpm = 0;
+
+    if (fan.getFanRPMReading(EMC230X::FANCNTRL_1, &amp;rpm) == EMC230X::EMC230X_STATUS_OK)
+    {
+        <span class="c-cm">// rpm == 0 here means genuinely stopped, not a read failure</span>
+    }
+}
+
+fan.runControlAlgorithm(EMC230X::FANCNTRL_1, 0);   <span class="c-cm">// park the fan</span></code></pre>
+    <p>Why these settings suit that fan:</p>
+    <div class="tw">
+      <table>
+        <thead><tr><th>Setting</th><th>Value</th><th>Reason</th></tr></thead>
+        <tbody>
+          <tr><td class="mono">EDG</td><td class="mono">01 (5 edges)</td><td class="desc">2 tach pulses per revolution.</td></tr>
+          <tr><td class="mono">FRNG</td><td class="mono">00 (×1)</td><td class="desc">Covers 480&ndash;5000 RPM without the count overflowing at the low end.</td></tr>
+          <tr><td class="mono">UDT</td><td class="mono">011 (400 ms)</td><td class="desc">Comfortably longer than the 250 ms a measurement takes at the slowest speed.</td></tr>
+          <tr><td class="mono">ERG</td><td class="mono">01 (50 RPM)</td><td class="desc">1% at top speed; a wider window hunts audibly at idle.</td></tr>
+          <tr><td class="mono">Base freq</td><td class="mono">26 kHz</td><td class="desc">Inside the 21&ndash;28 kHz the 4-wire fan specification requires. Lower settings are audible.</td></tr>
+          <tr><td class="mono">Output</td><td class="mono">Open drain</td><td class="desc">The fan supplies its own pull-up on the PWM input.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="pitfalls">
+    <h2 class="sec">Pitfalls</h2>
+
+    <h3>A stopped fan reads 8191, not 0</h3>
+    <p>The count is a period. No tachometer edges means the counter runs to full scale. Treat
+    <code>0x1FFF</code> as "not turning" &mdash; which is exactly what the RPM accessors do,
+    reporting 0 RPM with an OK status.</p>
+
+    <h3>The drive register is read-only in closed loop</h3>
+    <p><code>setFanDriveSettings()</code> silently has no effect while <code>ENAG = 1</code>. Call
+    <code>toggleControlAlgorithm(fan, false)</code> first if you want direct duty control.</p>
+
+    <h3>Software lock survives until power cycle</h3>
+    <p>If the lock bit is set, every write is silently ignored and no error is reported &mdash; the
+    bus transaction succeeds. Check it before concluding your configuration is not taking.</p>
+
+    <h3>Minimum drive too low will stall the loop</h3>
+    <p>If the PID can command a duty below the one at which the fan stops turning, it will &mdash;
+    then chase a fan that is no longer moving, trigger spin-up, and oscillate. Set
+    <code>setFanMinDrive()</code> from a measured duty sweep rather than a guess.</p>
+
+    <h3>Fan alerts while intentionally stopped</h3>
+    <p>A fan parked on purpose still trips the stall and spin-up status bits and asserts ALERT.
+    Clear that channel's interrupt enable before stopping it, or gate your handler on your own
+    "commanded off" state.</p>
+
+    <h3>Reserved registers on smaller parts</h3>
+    <p>The fan 3&ndash;5 registers do not exist on an EMC2301 or EMC2302. This driver masks them
+    automatically once the part is identified. If you extend it, preserve that &mdash; and never
+    let a partial read leave earlier channels holding an unshifted count.</p>
+  </section>
+
+  <section id="refs">
+    <h2 class="sec">References</h2>
+    <ul>
+      <li><a href="https://ww1.microchip.com/downloads/aemDocuments/documents/MSLD/ProductDocuments/DataSheets/EMC2301-2-3-5-Data-Sheet-DS20006532A.pdf">EMC2301/2/3/5 Data Sheet (DS20006532A)</a>
+      &mdash; register map, equations 4-2 and 4-3, and the fan speed control algorithm. The
+      authority for everything on this page.</li>
+      <li><a href="https://www.microchip.com/en-us/product/emc2302">EMC2302 product page</a>
+      &mdash; ordering information, package options and errata.</li>
+      <li><a href="https://ww1.microchip.com/downloads/en/AppNotes/en562764.pdf">AN17.4 &mdash; RPM to TACH Counts Conversion</a>
+      &mdash; the conversion tabulated for every range and pole count.</li>
+    </ul>
+    <p>Section numbers quoted throughout refer to DS20006532A.</p>
+  </section>
+
+  </main>
+</div>
+
+<footer>
+  <div class="footer-inner">
+    <p><strong>EMC230X Driver v1.0</strong><br>
+    Author: Michael Margolese<br>
+    Copyright &copy; 2024&ndash;2026 Tenuvah Designs. All rights reserved.</p>
+    <p>Written against DS20006532A and AN17.4. EMC2301, EMC2302, EMC2303 and EMC2305 are products
+    of Microchip Technology Inc.; this driver is an independent implementation and is not
+    affiliated with or endorsed by Microchip.</p>
+  </div>
+</footer>
