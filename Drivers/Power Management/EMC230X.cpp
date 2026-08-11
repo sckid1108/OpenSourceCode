@@ -1,12 +1,31 @@
-/*
- * EMC230X.cpp
+/*******************************************************************************
+ * @file      EMC230X.cpp
+ * @brief     Implementation of the Microchip EMC2301/2/3/5 fan controller driver.
  *
- *  Created on: Nov 8, 2024
- *      Author: Michael Margolese
- */
+ * @details   See EMC230X.hpp for the API and usage. Points worth knowing when
+ *            working in this file:
+ *
+ *            - The 13-bit tach count is left-justified in its register pair
+ *              (FxTT/FxTR[12:5] high byte, [4:0] in low-byte bits 7:3). Reads shift
+ *              right by 3 as each fan's pair completes; writes shift left by 3.
+ *              Never split that shift away from the byte assembly -- a failure part
+ *              way through would otherwise leave earlier fans scaled by 8.
+ *
+ *            - Per-fan registers are only touched for channels the detected part
+ *              implements; ensureIdentified() reads the product ID on first use.
+ *
+ *            - No exceptions, no heap, no platform headers. Errors are reported
+ *              through EMC230X_STATUS, which is a set of bit flags.
+ *
+ * @version   1.0
+ * @date      Created  8 November 2024
+ * @date      Modified 11 August 2026
+ *
+ * @author    Michael Margolese
+ * @copyright Copyright (c) 2024-2026 Tenuvah Designs. All rights reserved.
+ ******************************************************************************/
 
 #include <EMC230X.hpp>
-#include <cassert>
 
 namespace EMC230X
 {
@@ -20,33 +39,57 @@ EMC230X::EMC230X(uint8_t addr_, smbus_write_register write_func, smbus_read_regi
 
 EMC230X::EMC230X()
 {
-	// Base config for a fan with 2 poles and 500 min RPM.
-	// Fan starts in off state.
-	i2cAddr                 = I2C_ADDRESS;
+	// Nothing is touched on the chip here -- this only clears the local cache. No I2C
+	// happens until setI2CDriver() has been called and a get/set is issued.
+	//
+	// The pole fields default to FANPOLE_2 to match the EMC230x reset value of the
+	// EDG field (01b, 5 edges), which is the standard 4-wire fan giving 2 tach pulses
+	// per revolution. getFanConfig1() overwrites these with what the chip reports.
+	i2cAddr                 = I2C_ADDRESS; // 0x2F; overridden by setI2CDriver()
 	smbus_write_reg         = nullptr;
 	smbus_read_reg          = nullptr;
 	emc230xState_           = {0};
-	fanControllers_         = EMC230X_FAN::FANCNTRL_1;
-	fan1Poles_               = EMC230X_FANPOLES::FANPOLE_1;
-	fan2Poles_               = EMC230X_FANPOLES::FANPOLE_1;
-	fan3Poles_               = EMC230X_FANPOLES::FANPOLE_1;
-	fan4Poles_               = EMC230X_FANPOLES::FANPOLE_1;
-	fan5Poles_               = EMC230X_FANPOLES::FANPOLE_1;
-	tachFan1PolesMultiplier_ = 0;
-	tachFan2PolesMultiplier_ = 0;
-	tachFan3PolesMultiplier_ = 0;
-	tachFan4PolesMultiplier_ = 0;
-	tachFan5PolesMultiplier_ = 0;
+	fanControllers_         = FANCNTRL_1;  // until getChipInfo() identifies the part
+	chipIdentified_         = false;
+	fan1Poles_               = EMC230X_FANPOLES::FANPOLE_2;
+	fan2Poles_               = EMC230X_FANPOLES::FANPOLE_2;
+	fan3Poles_               = EMC230X_FANPOLES::FANPOLE_2;
+	fan4Poles_               = EMC230X_FANPOLES::FANPOLE_2;
+	fan5Poles_               = EMC230X_FANPOLES::FANPOLE_2;
+	tachFan1PolesMultiplier_ = 2;          // poles = FANPOLE enum value + 1
+	tachFan2PolesMultiplier_ = 2;
+	tachFan3PolesMultiplier_ = 2;
+	tachFan4PolesMultiplier_ = 2;
+	tachFan5PolesMultiplier_ = 2;
 }
 
 EMC230X::~EMC230X()
 {
 }
 
+/* Reads the product ID once so fanControllers_ can be trusted. The per-fan getters call
+   this first: registers belonging to a fan the part does not implement are reserved, and
+   reading them is what made this driver misbehave on the smaller parts. getChipInfo()
+   touches only chip-level registers, so there is no recursion back into here. */
+EMC230X_STATUS EMC230X::ensureIdentified()
+{
+	if (chipIdentified_)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_OK;
+	}
+
+	return getChipInfo();
+}
+
 EMC230X_STATUS EMC230X::getChipState()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	EMC230X_STATUS status = EMC230X_STATUS::EMC230X_STATUS_OK;
 	status = (EMC230X_STATUS) (status | getChipInfo());
@@ -76,8 +119,13 @@ EMC230X_STATUS EMC230X::getChipState()
 
 EMC230X_STATUS EMC230X::getChipInfo()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	emc230xState_.ChipInfo.ProductFeatures = 0;
 	emc230xState_.ChipInfo.ProductID       = 0;
@@ -86,44 +134,55 @@ EMC230X_STATUS EMC230X::getChipInfo()
 	int state = 0;
 	uint8_t udata = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_PRODUCTFEATURES, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_PRODUCTFEATURES, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.ChipInfo.ProductFeatures = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_PRODUCTID, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_PRODUCTID, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.ChipInfo.ProductID = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_MANUFACTURERID, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_MANUFACTURERID, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.ChipInfo.ManufacturerID = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_CHIPREVISION, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_CHIPREVISION, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.ChipInfo.Revision = udata;
 
+	// Mask of the channels this part has, not just the highest one -- an EMC2303 has
+	// fans 1, 2 and 3, so 0x07. Callers use it to avoid touching absent channels;
+	// registers for a fan the part does not implement are reserved.
 	switch ((EMC230X_PRODUCTID)emc230xState_.ChipInfo.ProductID)
 	{
-		case EMC230X_PRODUCTID::EMC2301_ID: fanControllers_ = EMC230X_FAN::FANCNTRL_1; break;
-		case EMC230X_PRODUCTID::EMC2302_ID: fanControllers_ = EMC230X_FAN::FANCNTRL_2; break;
-		case EMC230X_PRODUCTID::EMC2303_ID: fanControllers_ = EMC230X_FAN::FANCNTRL_3; break;
-		case EMC230X_PRODUCTID::EMC2305_ID: fanControllers_ = EMC230X_FAN::FANCNTRL_5; break;
-		default: fanControllers_ = EMC230X_FAN::FANCNTRL_1;
+		case EMC230X_PRODUCTID::EMC2301_ID: fanControllers_ = FANCNTRL_1; break;
+		case EMC230X_PRODUCTID::EMC2302_ID: fanControllers_ = FANCNTRL_1 | FANCNTRL_2; break;
+		case EMC230X_PRODUCTID::EMC2303_ID: fanControllers_ = FANCNTRL_1 | FANCNTRL_2 | FANCNTRL_3; break;
+		case EMC230X_PRODUCTID::EMC2305_ID: fanControllers_ = FANCNTRL_1 | FANCNTRL_2 | FANCNTRL_3 |
+		                                                      FANCNTRL_4 | FANCNTRL_5; break;
+		default: fanControllers_ = FANCNTRL_1; break; // unrecognised part: assume one fan
 	}
+
+	chipIdentified_ = true;
 
 	return EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getChipConfig()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
 	emc230xState_.Configuration.Config = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_CONFIGURATION, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_CONFIGURATION, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.Configuration.Config = udata;
 
@@ -132,14 +191,19 @@ EMC230X_STATUS EMC230X::getChipConfig()
 
 EMC230X_STATUS EMC230X::getFanStatus()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
 	emc230xState_.FanStatus.fanStatus = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_STATUS, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_STATUS, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.FanStatus.fanStatus = udata;
 
@@ -148,14 +212,19 @@ EMC230X_STATUS EMC230X::getFanStatus()
 
 EMC230X_STATUS EMC230X::getFanStallStatus()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
 	emc230xState_.FanStallStatus.fanStallStatus = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_STALLSTATUS, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_STALLSTATUS, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.FanStallStatus.fanStallStatus = udata;
 
@@ -164,14 +233,19 @@ EMC230X_STATUS EMC230X::getFanStallStatus()
 
 EMC230X_STATUS EMC230X::getFanSpinStatus()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
 	emc230xState_.FanSpinStatus.fanSpinStatus = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_SPINSTATUS, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_SPINSTATUS, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.FanSpinStatus.fanSpinStatus = udata;
 
@@ -180,14 +254,19 @@ EMC230X_STATUS EMC230X::getFanSpinStatus()
 
 EMC230X_STATUS EMC230X::getDriveFailStatus()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
 	emc230xState_.DriveFailStatus.driveFailStatus = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_DRIVEFAILSTATUS, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_DRIVEFAILSTATUS, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.DriveFailStatus.driveFailStatus = udata;
 
@@ -196,14 +275,19 @@ EMC230X_STATUS EMC230X::getDriveFailStatus()
 
 EMC230X_STATUS EMC230X::getFanInterruptEnable()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
 	emc230xState_.FanInterruptEnable.fanInterruptEnable = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_INTERUPTENABLE, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_INTERRUPTENABLE, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.FanInterruptEnable.fanInterruptEnable = (uint8_t)(udata & 0x1F);
 
@@ -212,14 +296,19 @@ EMC230X_STATUS EMC230X::getFanInterruptEnable()
 
 EMC230X_STATUS EMC230X::getPWMPolarity()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
 	emc230xState_.PWMPolarity.pwmPolarity = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_PWMPOLARITY, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_PWMPOLARITY, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.PWMPolarity.pwmPolarity = udata;
 
@@ -228,14 +317,19 @@ EMC230X_STATUS EMC230X::getPWMPolarity()
 
 EMC230X_STATUS EMC230X::getPWMOutput()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
 	emc230xState_.PWMOutputConfig.pwmOutputConfig = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_PWMOUTPUT, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_PWMOUTPUT, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.PWMOutputConfig.pwmOutputConfig = udata;
 
@@ -244,19 +338,24 @@ EMC230X_STATUS EMC230X::getPWMOutput()
 
 EMC230X_STATUS EMC230X::getPWMBaseFreq()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
 	emc230xState_.PWMBaseF123.pwmBaseF123 = 0;
 	emc230xState_.PWMBaseF45.pwmBaseF45 = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_PWMBASEFREQ45, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_PWMBASEFREQ45, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.PWMBaseF45.pwmBaseF45 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_PWMBASEFREQ123, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_PWMBASEFREQ123, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.PWMBaseF123.pwmBaseF123 = udata;
 
@@ -265,8 +364,21 @@ EMC230X_STATUS EMC230X::getPWMBaseFreq()
 
 EMC230X_STATUS EMC230X::getPWMDivider()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -276,33 +388,66 @@ EMC230X_STATUS EMC230X::getPWMDivider()
 	emc230xState_.PWMDividers.PWM4Div = 0;
 	emc230xState_.PWMDividers.PWM5Div = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1PWMDIVIDE, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.PWMDividers.PWM1Div = udata;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1PWMDIVIDE, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.PWMDividers.PWM1Div = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2PWMDIVIDE, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.PWMDividers.PWM2Div = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3PWMDIVIDE, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.PWMDividers.PWM3Div = udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2PWMDIVIDE, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.PWMDividers.PWM2Div = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4PWMDIVIDE, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.PWMDividers.PWM4Div = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5PWMDIVIDE, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.PWMDividers.PWM5Div = udata;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3PWMDIVIDE, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.PWMDividers.PWM3Div = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4PWMDIVIDE, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.PWMDividers.PWM4Div = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5PWMDIVIDE, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.PWMDividers.PWM5Div = udata;
+
+	}
 
 	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getFanDriveSettings()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -312,33 +457,66 @@ EMC230X_STATUS EMC230X::getFanDriveSettings()
 	emc230xState_.FanDriveSetting.PWM4 = 0;
 	emc230xState_.FanDriveSetting.PWM5 = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1DRIVESETTING, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDriveSetting.PWM1 = udata;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1DRIVESETTING, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDriveSetting.PWM1 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2DRIVESETTING, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDriveSetting.PWM2 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3DRIVESETTING, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDriveSetting.PWM3 = udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2DRIVESETTING, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDriveSetting.PWM2 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4DRIVESETTING, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDriveSetting.PWM4 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5DRIVESETTING, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDriveSetting.PWM5 = udata;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3DRIVESETTING, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDriveSetting.PWM3 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4DRIVESETTING, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDriveSetting.PWM4 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5DRIVESETTING, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDriveSetting.PWM5 = udata;
+
+	}
 
 	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getFanConfig1()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -348,25 +526,45 @@ EMC230X_STATUS EMC230X::getFanConfig1()
 	emc230xState_.Fan4Config1.fanConfig1 = 0;
 	emc230xState_.Fan5Config1.fanConfig1 = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1CONFIG1, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan1Config1.fanConfig1 = udata;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1CONFIG1, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan1Config1.fanConfig1 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2CONFIG1, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan2Config1.fanConfig1 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3CONFIG1, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan3Config1.fanConfig1 = udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2CONFIG1, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan2Config1.fanConfig1 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4CONFIG1, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan4Config1.fanConfig1 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5CONFIG1, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan5Config1.fanConfig1 = udata;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3CONFIG1, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan3Config1.fanConfig1 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4CONFIG1, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan4Config1.fanConfig1 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5CONFIG1, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan5Config1.fanConfig1 = udata;
+
+	}
 
 	fan1Poles_ = (EMC230X_FANPOLES) emc230xState_.Fan1Config1.EDG;
 	fan2Poles_ = (EMC230X_FANPOLES) emc230xState_.Fan2Config1.EDG;
@@ -385,8 +583,21 @@ EMC230X_STATUS EMC230X::getFanConfig1()
 
 EMC230X_STATUS EMC230X::getFanConfig2()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -396,33 +607,66 @@ EMC230X_STATUS EMC230X::getFanConfig2()
 	emc230xState_.Fan4Config2.fanConfig2 = 0;
 	emc230xState_.Fan5Config2.fanConfig2 = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1CONFIG2, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan1Config2.fanConfig2 = udata;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1CONFIG2, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan1Config2.fanConfig2 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2CONFIG2, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan2Config2.fanConfig2 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3CONFIG2, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan3Config2.fanConfig2 = udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2CONFIG2, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan2Config2.fanConfig2 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4CONFIG2, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan4Config2.fanConfig2 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5CONFIG2, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan5Config2.fanConfig2 = udata;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3CONFIG2, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan3Config2.fanConfig2 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4CONFIG2, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan4Config2.fanConfig2 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5CONFIG2, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan5Config2.fanConfig2 = udata;
+
+	}
 
 	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getPIDGain()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -432,33 +676,66 @@ EMC230X_STATUS EMC230X::getPIDGain()
 	emc230xState_.Fan4PIDGain.pidGain = 0;
 	emc230xState_.Fan5PIDGain.pidGain = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1PIDGAIN, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan1PIDGain.pidGain = udata;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1PIDGAIN, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan1PIDGain.pidGain = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2PIDGAIN, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan2PIDGain.pidGain = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3PIDGAIN, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan3PIDGain.pidGain = udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2PIDGAIN, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan2PIDGain.pidGain = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4PIDGAIN, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan4PIDGain.pidGain = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5PIDGAIN, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.Fan5PIDGain.pidGain = udata;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3PIDGAIN, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan3PIDGain.pidGain = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4PIDGAIN, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan4PIDGain.pidGain = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5PIDGAIN, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.Fan5PIDGain.pidGain = udata;
+
+	}
 
 	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getFanSpinUpConfig()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -468,33 +745,66 @@ EMC230X_STATUS EMC230X::getFanSpinUpConfig()
 	emc230xState_.FanSpinUp4.fanSpinUpConfig = 0;
 	emc230xState_.FanSpinUp5.fanSpinUpConfig = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1SPINUP, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanSpinUp1.fanSpinUpConfig = udata;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1SPINUP, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanSpinUp1.fanSpinUpConfig = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2SPINUP, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanSpinUp2.fanSpinUpConfig = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3SPINUP, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanSpinUp3.fanSpinUpConfig = udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2SPINUP, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanSpinUp2.fanSpinUpConfig = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4SPINUP, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanSpinUp4.fanSpinUpConfig = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5SPINUP, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanSpinUp5.fanSpinUpConfig = udata;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3SPINUP, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanSpinUp3.fanSpinUpConfig = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4SPINUP, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanSpinUp4.fanSpinUpConfig = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5SPINUP, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanSpinUp5.fanSpinUpConfig = udata;
+
+	}
 
 	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getFanMaxStep()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -504,33 +814,66 @@ EMC230X_STATUS EMC230X::getFanMaxStep()
 	emc230xState_.FanDrvMaxStepSize4 = 0;
 	emc230xState_.FanDrvMaxStepSize5 = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1MAXSTEP, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDrvMaxStepSize1 = udata;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1MAXSTEP, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDrvMaxStepSize1 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2MAXSTEP, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDrvMaxStepSize2 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3MAXSTEP, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDrvMaxStepSize3 = udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2MAXSTEP, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDrvMaxStepSize2 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4MAXSTEP, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDrvMaxStepSize4 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5MAXSTEP, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDrvMaxStepSize5 = udata;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3MAXSTEP, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDrvMaxStepSize3 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4MAXSTEP, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDrvMaxStepSize4 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5MAXSTEP, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDrvMaxStepSize5 = udata;
+
+	}
 
 	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getFanMinDrive()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -540,33 +883,66 @@ EMC230X_STATUS EMC230X::getFanMinDrive()
 	emc230xState_.FanDrvMinStepSize4 = 0;
 	emc230xState_.FanDrvMinStepSize5 = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1MINDRIVE, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDrvMinStepSize1 = udata;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1MINDRIVE, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDrvMinStepSize1 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2MINDRIVE, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDrvMinStepSize2 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3MINDRIVE, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDrvMinStepSize3 = udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2MINDRIVE, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDrvMinStepSize2 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4MINDRIVE, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDrvMinStepSize4 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5MINDRIVE, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.FanDrvMinStepSize5 = udata;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3MINDRIVE, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDrvMinStepSize3 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4MINDRIVE, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDrvMinStepSize4 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5MINDRIVE, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.FanDrvMinStepSize5 = udata;
+
+	}
 
 	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getFanValidTachCount()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -576,33 +952,66 @@ EMC230X_STATUS EMC230X::getFanValidTachCount()
 	emc230xState_.ValidTachCount4 = 0;
 	emc230xState_.ValidTachCount5 = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1VALTACHCOUNT, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.ValidTachCount1 = udata;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1VALTACHCOUNT, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.ValidTachCount1 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2VALTACHCOUNT, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.ValidTachCount2 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3VALTACHCOUNT, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.ValidTachCount3 = udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2VALTACHCOUNT, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.ValidTachCount2 = udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4VALTACHCOUNT, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.ValidTachCount4 = udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5VALTACHCOUNT, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.ValidTachCount5 = udata;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3VALTACHCOUNT, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.ValidTachCount3 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4VALTACHCOUNT, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.ValidTachCount4 = udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5VALTACHCOUNT, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.ValidTachCount5 = udata;
+
+	}
 
 	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getDriveFailBand()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -612,53 +1021,86 @@ EMC230X_STATUS EMC230X::getDriveFailBand()
 	emc230xState_.DriveFailBand4 = 0;
 	emc230xState_.DriveFailBand5 = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1DRVFAILMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.DriveFailBand1 = udata << 8;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1DRVFAILMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.DriveFailBand1 = udata << 8;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1DRVFAILLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.DriveFailBand1 += udata;
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1DRVFAILLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.DriveFailBand1 += udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2DRVFAILMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.DriveFailBand2 = udata << 8;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2DRVFAILLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.DriveFailBand2 += udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2DRVFAILMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.DriveFailBand2 = udata << 8;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3DRVFAILMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.DriveFailBand3 = udata << 8;
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2DRVFAILLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.DriveFailBand2 += udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3DRVFAILLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.DriveFailBand3 += udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4DRVFAILMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.DriveFailBand4 = udata << 8;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3DRVFAILMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.DriveFailBand3 = udata << 8;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4DRVFAILLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.DriveFailBand4 += udata;
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3DRVFAILLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.DriveFailBand3 += udata;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5DRVFAILMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.DriveFailBand5 = udata << 8;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5DRVFAILLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.DriveFailBand5 += udata;
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4DRVFAILMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.DriveFailBand4 = udata << 8;
+
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4DRVFAILLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.DriveFailBand4 += udata;
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5DRVFAILMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.DriveFailBand5 = udata << 8;
+
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5DRVFAILLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.DriveFailBand5 += udata;
+
+	}
 
 	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getFanTachTarget()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -668,53 +1110,87 @@ EMC230X_STATUS EMC230X::getFanTachTarget()
 	emc230xState_.TachTarget4 = 0;
 	emc230xState_.TachTarget5 = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1TACHTARGETMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachTarget1 = udata << 8;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1TACHTARGETMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachTarget1 = udata << 8;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1TACHTARGETLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachTarget1 += udata;
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1TACHTARGETLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachTarget1 = (uint16_t)((emc230xState_.TachTarget1 + udata) >> 3);
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2TACHTARGETMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachTarget2 = udata << 8;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2TACHTARGETLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachTarget2 += udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2TACHTARGETMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachTarget2 = udata << 8;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3TACHTARGETMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachTarget3 = udata << 8;
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2TACHTARGETLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachTarget2 = (uint16_t)((emc230xState_.TachTarget2 + udata) >> 3);
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3TACHTARGETLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachTarget3 += udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4TACHTARGETMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachTarget4 = udata << 8;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3TACHTARGETMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachTarget3 = udata << 8;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4TACHTARGETLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachTarget4 += udata;
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3TACHTARGETLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachTarget3 = (uint16_t)((emc230xState_.TachTarget3 + udata) >> 3);
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5TACHTARGETMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachTarget5 = udata << 8;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5TACHTARGETLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachTarget5 += udata;
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4TACHTARGETMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachTarget4 = udata << 8;
+
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4TACHTARGETLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachTarget4 = (uint16_t)((emc230xState_.TachTarget4 + udata) >> 3);
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5TACHTARGETMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachTarget5 = udata << 8;
+
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5TACHTARGETLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachTarget5 = (uint16_t)((emc230xState_.TachTarget5 + udata) >> 3);
+
+	}
+
 
 	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getFanTachReading()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// Identify the part before touching per-fan registers -- the ones belonging to a
+	// fan this device does not implement are reserved.
+	EMC230X_STATUS ident = ensureIdentified();
+	if (ident != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return ident;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
@@ -724,59 +1200,85 @@ EMC230X_STATUS EMC230X::getFanTachReading()
 	emc230xState_.TachCurrent4 = 0;
 	emc230xState_.TachCurrent5 = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1TACHREADMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachCurrent1 = udata << 8;
+	if (fanControllers_ & FANCNTRL_1)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1TACHREADMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachCurrent1 = udata << 8;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN1TACHREADLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachCurrent1 += udata;
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN1TACHREADLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachCurrent1 = (uint16_t)((emc230xState_.TachCurrent1 + udata) >> 3);
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2TACHREADMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachCurrent2 = udata << 8;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN2TACHREADLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachCurrent2 += udata;
+	if (fanControllers_ & FANCNTRL_2)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2TACHREADMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachCurrent2 = udata << 8;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3TACHREADMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachCurrent3 = udata << 8;
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN2TACHREADLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachCurrent2 = (uint16_t)((emc230xState_.TachCurrent2 + udata) >> 3);
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN3TACHREADLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachCurrent3 += udata;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4TACHREADMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachCurrent4 = udata << 8;
+	if (fanControllers_ & FANCNTRL_3)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3TACHREADMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachCurrent3 = udata << 8;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN4TACHREADLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachCurrent4 += udata;
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN3TACHREADLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachCurrent3 = (uint16_t)((emc230xState_.TachCurrent3 + udata) >> 3);
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5TACHREADMSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachCurrent5 = udata << 8;
+	}
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_FAN5TACHREADLSB, &udata, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
-	else emc230xState_.TachCurrent5 += udata;
+	if (fanControllers_ & FANCNTRL_4)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4TACHREADMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachCurrent4 = udata << 8;
+
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN4TACHREADLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachCurrent4 = (uint16_t)((emc230xState_.TachCurrent4 + udata) >> 3);
+
+	}
+
+	if (fanControllers_ & FANCNTRL_5)
+	{
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5TACHREADMSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachCurrent5 = udata << 8;
+
+		state = smbus_read_reg(i2cAddr, EMC230X_REG_FAN5TACHREADLSB, &udata, 1);
+		if (state != 0) return EMC230X_STATUS_FAIL;
+		else emc230xState_.TachCurrent5 = (uint16_t)((emc230xState_.TachCurrent5 + udata) >> 3);
+
+	}
+
 
 	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
 EMC230X_STATUS EMC230X::getSoftWareLock()
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	int state = 0;
 	uint8_t udata = 0;
 	emc230xState_.SoftwareLock = 0;
 
-	state = smbus_read_reg(I2C_ADDRESS, EMC230X_REG_SOFTWARELOCK, &udata, 1);
+	state = smbus_read_reg(i2cAddr, EMC230X_REG_SOFTWARELOCK, &udata, 1);
 	if (state != 0) return EMC230X_STATUS_FAIL;
 	else emc230xState_.SoftwareLock = udata;
 
@@ -798,6 +1300,7 @@ EMC230X_FANPOLES EMC230X::getFanPoles(EMC230X_FAN fan)
 
 uint16_t EMC230X::getFanTachReading(EMC230X_FAN fan)
 {
+	if (!isValidFan(fan)) return 0;
 	switch (fan)
 	{
 		case EMC230X_FAN::FANCNTRL_1 : return emc230xState_.TachCurrent1;
@@ -814,9 +1317,22 @@ uint16_t EMC230X::getFanTachReading(EMC230X_FAN fan)
 //0 = PWM x drive setting of 00h produces 0% duty cycle, drive setting of FFh produces 100% duty cycle.
 EMC230X_STATUS EMC230X::setPWMPolarity(EMC230X_FAN fan, uint8_t polarity)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	if (polarity > 1) polarity = 1;
 
 	EMC230X_STATUS state = getPWMPolarity();
+
+	// These setters are read-modify-write: bail if the read failed, otherwise we
+	// would write the zeroed cache back over the chip's real configuration.
+	if (state != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return state;
+	}
 
 	if (fan == EMC230X_FAN::FANCNTRL_1) emc230xState_.PWMPolarity.POLARITY1 = polarity;
 	if (fan == EMC230X_FAN::FANCNTRL_2) emc230xState_.PWMPolarity.POLARITY2 = polarity;
@@ -824,8 +1340,12 @@ EMC230X_STATUS EMC230X::setPWMPolarity(EMC230X_FAN fan, uint8_t polarity)
 	if (fan == EMC230X_FAN::FANCNTRL_4) emc230xState_.PWMPolarity.POLARITY4 = polarity;
 	if (fan == EMC230X_FAN::FANCNTRL_5) emc230xState_.PWMPolarity.POLARITY5 = polarity;
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, EMC230X_REG_PWMPOLARITY, &emc230xState_.PWMPolarity.pwmPolarity, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, EMC230X_REG_PWMPOLARITY, &emc230xState_.PWMPolarity.pwmPolarity, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getPWMPolarity();
 	return state;
@@ -835,9 +1355,22 @@ EMC230X_STATUS EMC230X::setPWMPolarity(EMC230X_FAN fan, uint8_t polarity)
 // 0 - PWM x is Open Drain Type
 EMC230X_STATUS EMC230X::setPWMOutput(EMC230X_FAN fan, uint8_t iotype)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	if (iotype > 1) iotype = 1;
 
 	EMC230X_STATUS state = getPWMOutput();
+
+	// These setters are read-modify-write: bail if the read failed, otherwise we
+	// would write the zeroed cache back over the chip's real configuration.
+	if (state != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return state;
+	}
 
 	if (fan == EMC230X_FAN::FANCNTRL_1) emc230xState_.PWMOutputConfig.PWMOUT1 = iotype;
 	if (fan == EMC230X_FAN::FANCNTRL_2) emc230xState_.PWMOutputConfig.PWMOUT2 = iotype;
@@ -845,16 +1378,33 @@ EMC230X_STATUS EMC230X::setPWMOutput(EMC230X_FAN fan, uint8_t iotype)
 	if (fan == EMC230X_FAN::FANCNTRL_4) emc230xState_.PWMOutputConfig.PWMOUT4 = iotype;
 	if (fan == EMC230X_FAN::FANCNTRL_5) emc230xState_.PWMOutputConfig.PWMOUT5 = iotype;
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, EMC230X_REG_PWMPOLARITY, &emc230xState_.PWMOutputConfig.pwmOutputConfig, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, EMC230X_REG_PWMPOLARITY, &emc230xState_.PWMOutputConfig.pwmOutputConfig, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getPWMOutput();
 	return state;
 }
 
-EMC230X_STATUS EMC230X::setPWMBaseFreq(EMC230X_FAN fan, EMMC230X_PWMFREQ freq)
+EMC230X_STATUS EMC230X::setPWMBaseFreq(EMC230X_FAN fan, EMC230X_PWMFREQ freq)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	EMC230X_STATUS state = getPWMBaseFreq();
+
+	// These setters are read-modify-write: bail if the read failed, otherwise we
+	// would write the zeroed cache back over the chip's real configuration.
+	if (state != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return state;
+	}
 
 	uint8_t reg = 0;
 	uint8_t addr = 0;
@@ -865,8 +1415,12 @@ EMC230X_STATUS EMC230X::setPWMBaseFreq(EMC230X_FAN fan, EMMC230X_PWMFREQ freq)
 	if (fan == EMC230X_FAN::FANCNTRL_4) {addr = EMC230X_REG_PWMBASEFREQ45;  emc230xState_.PWMBaseF45.PMB4 = freq; reg = emc230xState_.PWMBaseF45.pwmBaseF45;}
 	if (fan == EMC230X_FAN::FANCNTRL_5) {addr = EMC230X_REG_PWMBASEFREQ45;  emc230xState_.PWMBaseF45.PMB5 = freq; reg = emc230xState_.PWMBaseF45.pwmBaseF45;}
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addr, &reg, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addr, &reg, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getPWMBaseFreq();
 	return state;
@@ -874,7 +1428,20 @@ EMC230X_STATUS EMC230X::setPWMBaseFreq(EMC230X_FAN fan, EMMC230X_PWMFREQ freq)
 
 EMC230X_STATUS EMC230X::setPWMDivider(EMC230X_FAN fan, uint8_t divider)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	EMC230X_STATUS state = getPWMDivider();
+
+	// These setters are read-modify-write: bail if the read failed, otherwise we
+	// would write the zeroed cache back over the chip's real configuration.
+	if (state != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return state;
+	}
 
 	uint8_t reg = 0;
 	uint8_t addr = 0;
@@ -885,8 +1452,12 @@ EMC230X_STATUS EMC230X::setPWMDivider(EMC230X_FAN fan, uint8_t divider)
 	if (fan == EMC230X_FAN::FANCNTRL_4) {addr = EMC230X_REG_FAN4PWMDIVIDE; emc230xState_.PWMDividers.PWM4Div = divider; reg = emc230xState_.PWMDividers.PWM4Div;}
 	if (fan == EMC230X_FAN::FANCNTRL_5) {addr = EMC230X_REG_FAN5PWMDIVIDE; emc230xState_.PWMDividers.PWM5Div = divider; reg = emc230xState_.PWMDividers.PWM5Div;}
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addr, &reg, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addr, &reg, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getPWMDivider();
 	return state;
@@ -894,7 +1465,20 @@ EMC230X_STATUS EMC230X::setPWMDivider(EMC230X_FAN fan, uint8_t divider)
 
 EMC230X_STATUS EMC230X::setFanDriveSettings(EMC230X_FAN fan, uint8_t speed)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	EMC230X_STATUS state = getFanDriveSettings();
+
+	// These setters are read-modify-write: bail if the read failed, otherwise we
+	// would write the zeroed cache back over the chip's real configuration.
+	if (state != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return state;
+	}
 
 	uint8_t reg = 0;
 	uint8_t addr = 0;
@@ -905,8 +1489,12 @@ EMC230X_STATUS EMC230X::setFanDriveSettings(EMC230X_FAN fan, uint8_t speed)
 	if (fan == EMC230X_FAN::FANCNTRL_4) {addr = EMC230X_REG_FAN4DRIVESETTING; emc230xState_.FanDriveSetting.PWM4 = speed; reg = emc230xState_.FanDriveSetting.PWM4;}
 	if (fan == EMC230X_FAN::FANCNTRL_5) {addr = EMC230X_REG_FAN5DRIVESETTING; emc230xState_.FanDriveSetting.PWM5 = speed; reg = emc230xState_.FanDriveSetting.PWM5;}
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addr, &reg, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addr, &reg, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getFanDriveSettings();
 	return state;
@@ -914,16 +1502,38 @@ EMC230X_STATUS EMC230X::setFanDriveSettings(EMC230X_FAN fan, uint8_t speed)
 
 EMC230X_STATUS EMC230X::setFanInterrupt(EMC230X_FAN fan, bool enabled)
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	EMC230X_STATUS state = getFanInterruptEnable();
+
+	// These setters are read-modify-write: bail if the read failed, otherwise we
+	// would write the zeroed cache back over the chip's real configuration.
+	if (state != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return state;
+	}
 
 	if (enabled == true) emc230xState_.FanInterruptEnable.fanInterruptEnable |= (uint8_t) fan;
 	else emc230xState_.FanInterruptEnable.fanInterruptEnable &= (uint8_t) (~fan);
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, EMC230X_REG_INTERUPTENABLE, &emc230xState_.FanInterruptEnable.fanInterruptEnable, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, EMC230X_REG_INTERRUPTENABLE, &emc230xState_.FanInterruptEnable.fanInterruptEnable, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = (EMC230X_STATUS)(state | getFanInterruptEnable());
 	return state;
@@ -931,6 +1541,12 @@ EMC230X_STATUS EMC230X::setFanInterrupt(EMC230X_FAN fan, bool enabled)
 
 EMC230X_STATUS EMC230X::setFanConfig1(EMC230X_FAN fan, EMC230X_FanConfig1 cfg)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	EMC230X_STATUS state;
 
 	uint8_t reg = 0;
@@ -942,8 +1558,12 @@ EMC230X_STATUS EMC230X::setFanConfig1(EMC230X_FAN fan, EMC230X_FanConfig1 cfg)
 	if (fan == EMC230X_FAN::FANCNTRL_4) {addr = EMC230X_REG_FAN4CONFIG1; emc230xState_.Fan4Config1 = cfg; reg = emc230xState_.Fan4Config1.fanConfig1;}
 	if (fan == EMC230X_FAN::FANCNTRL_5) {addr = EMC230X_REG_FAN5CONFIG1; emc230xState_.Fan5Config1 = cfg; reg = emc230xState_.Fan5Config1.fanConfig1;}
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addr, &reg, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addr, &reg, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getFanConfig1();
 	return state;
@@ -951,6 +1571,12 @@ EMC230X_STATUS EMC230X::setFanConfig1(EMC230X_FAN fan, EMC230X_FanConfig1 cfg)
 
 EMC230X_STATUS EMC230X::setFanConfig2(EMC230X_FAN fan, EMC230X_FanConfig2 cfg)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	EMC230X_STATUS state;
 
 	uint8_t reg = 0;
@@ -962,8 +1588,12 @@ EMC230X_STATUS EMC230X::setFanConfig2(EMC230X_FAN fan, EMC230X_FanConfig2 cfg)
 	if (fan == EMC230X_FAN::FANCNTRL_4) {addr = EMC230X_REG_FAN4CONFIG2; emc230xState_.Fan4Config2 = cfg; reg = emc230xState_.Fan4Config2.fanConfig2;}
 	if (fan == EMC230X_FAN::FANCNTRL_5) {addr = EMC230X_REG_FAN5CONFIG2; emc230xState_.Fan5Config2 = cfg; reg = emc230xState_.Fan5Config2.fanConfig2;}
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addr, &reg, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addr, &reg, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getFanConfig2();
 	return state;
@@ -971,6 +1601,12 @@ EMC230X_STATUS EMC230X::setFanConfig2(EMC230X_FAN fan, EMC230X_FanConfig2 cfg)
 
 EMC230X_STATUS EMC230X::setPIDGain(EMC230X_FAN fan, EMC230X_PIDGain gain)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	EMC230X_STATUS state;
 
 	uint8_t reg = 0;
@@ -982,8 +1618,12 @@ EMC230X_STATUS EMC230X::setPIDGain(EMC230X_FAN fan, EMC230X_PIDGain gain)
 	if (fan == EMC230X_FAN::FANCNTRL_4) {addr = EMC230X_REG_FAN4PIDGAIN; emc230xState_.Fan4PIDGain = gain; reg = emc230xState_.Fan4PIDGain.pidGain;}
 	if (fan == EMC230X_FAN::FANCNTRL_5) {addr = EMC230X_REG_FAN5PIDGAIN; emc230xState_.Fan5PIDGain = gain; reg = emc230xState_.Fan5PIDGain.pidGain;}
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addr, &reg, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addr, &reg, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getPIDGain();
 	return state;
@@ -991,6 +1631,12 @@ EMC230X_STATUS EMC230X::setPIDGain(EMC230X_FAN fan, EMC230X_PIDGain gain)
 
 EMC230X_STATUS EMC230X::setFanSpinUpConfig(EMC230X_FAN fan, EMC230X_FanSpinUpConfig spinup)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	EMC230X_STATUS state;
 
 	uint8_t reg = 0;
@@ -1002,8 +1648,12 @@ EMC230X_STATUS EMC230X::setFanSpinUpConfig(EMC230X_FAN fan, EMC230X_FanSpinUpCon
 	if (fan == EMC230X_FAN::FANCNTRL_4) {addr = EMC230X_REG_FAN4SPINUP; emc230xState_.FanSpinUp4 = spinup; reg = emc230xState_.FanSpinUp4.fanSpinUpConfig;}
 	if (fan == EMC230X_FAN::FANCNTRL_5) {addr = EMC230X_REG_FAN5SPINUP; emc230xState_.FanSpinUp5 = spinup; reg = emc230xState_.FanSpinUp5.fanSpinUpConfig;}
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addr, &reg, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addr, &reg, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getFanSpinUpConfig();
 	return state;
@@ -1011,6 +1661,12 @@ EMC230X_STATUS EMC230X::setFanSpinUpConfig(EMC230X_FAN fan, EMC230X_FanSpinUpCon
 
 EMC230X_STATUS EMC230X::setFanMaxStep(EMC230X_FAN fan, uint8_t maxstep)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	EMC230X_STATUS state;
 
 	uint8_t reg = 0;
@@ -1022,8 +1678,12 @@ EMC230X_STATUS EMC230X::setFanMaxStep(EMC230X_FAN fan, uint8_t maxstep)
 	if (fan == EMC230X_FAN::FANCNTRL_4) {addr = EMC230X_REG_FAN4MAXSTEP; emc230xState_.FanDrvMaxStepSize4 = maxstep; reg = emc230xState_.FanDrvMaxStepSize4;}
 	if (fan == EMC230X_FAN::FANCNTRL_5) {addr = EMC230X_REG_FAN5MAXSTEP; emc230xState_.FanDrvMaxStepSize5 = maxstep; reg = emc230xState_.FanDrvMaxStepSize5;}
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addr, &reg, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addr, &reg, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getFanMaxStep();
 	return state;
@@ -1031,6 +1691,12 @@ EMC230X_STATUS EMC230X::setFanMaxStep(EMC230X_FAN fan, uint8_t maxstep)
 
 EMC230X_STATUS EMC230X::setFanMinDrive(EMC230X_FAN fan, uint8_t minstep)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	EMC230X_STATUS state;
 
 	uint8_t reg = 0;
@@ -1042,8 +1708,12 @@ EMC230X_STATUS EMC230X::setFanMinDrive(EMC230X_FAN fan, uint8_t minstep)
 	if (fan == EMC230X_FAN::FANCNTRL_4) {addr = EMC230X_REG_FAN4MINDRIVE; emc230xState_.FanDrvMinStepSize4 = minstep; reg = emc230xState_.FanDrvMinStepSize4;}
 	if (fan == EMC230X_FAN::FANCNTRL_5) {addr = EMC230X_REG_FAN5MINDRIVE; emc230xState_.FanDrvMinStepSize5 = minstep; reg = emc230xState_.FanDrvMinStepSize5;}
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addr, &reg, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addr, &reg, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getFanMinDrive();
 	return state;
@@ -1051,6 +1721,12 @@ EMC230X_STATUS EMC230X::setFanMinDrive(EMC230X_FAN fan, uint8_t minstep)
 
 EMC230X_STATUS EMC230X::setDriveFailBand(EMC230X_FAN fan, uint16_t fail)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	EMC230X_STATUS state;
 
 	uint8_t regmsb = (uint8_t)(fail >> 8);
@@ -1069,11 +1745,19 @@ EMC230X_STATUS EMC230X::setDriveFailBand(EMC230X_FAN fan, uint16_t fail)
 
 	if (fan == EMC230X_FAN::FANCNTRL_5) { addrmsb = EMC230X_REG_FAN5DRVFAILMSB; addrlsb = EMC230X_REG_FAN5DRVFAILLSB; }
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addrlsb, &reglsb, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addrlsb, &reglsb, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addrmsb, &regmsb, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addrmsb, &regmsb, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getDriveFailBand();
 	return state;
@@ -1081,11 +1765,26 @@ EMC230X_STATUS EMC230X::setDriveFailBand(EMC230X_FAN fan, uint16_t fail)
 
 EMC230X_STATUS EMC230X::setFanTachTarget(EMC230X_FAN fan, uint16_t tach)
 { // Always write LSB first pg. 45 datasheet
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 
-	uint8_t lsb = (uint8_t)(tach & 0x00FF);
-	uint8_t msb = (uint8_t)(tach >> 8);
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
+
+	// The 13-bit count is left-justified in the register pair (bits 15:3), so shift
+	// the whole value before splitting. Shifting the masked LSB alone leaves the MSB
+	// a factor of 8 short.
+	uint16_t raw = (uint16_t)(tach << 3);
+
+	uint8_t lsb = (uint8_t)(raw & 0x00FF);
+	uint8_t msb = (uint8_t)(raw >> 8);
 
 	uint8_t addrmsb = 0;
 	uint8_t addrlsb = 0;
@@ -1098,11 +1797,19 @@ EMC230X_STATUS EMC230X::setFanTachTarget(EMC230X_FAN fan, uint16_t tach)
 	if (fan == EMC230X_FAN::FANCNTRL_4) { addrmsb = EMC230X_REG_FAN4TACHTARGETMSB; addrlsb = EMC230X_REG_FAN4TACHTARGETLSB; }
 	if (fan == EMC230X_FAN::FANCNTRL_5) { addrmsb = EMC230X_REG_FAN5TACHTARGETMSB; addrlsb = EMC230X_REG_FAN5TACHTARGETLSB; }
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addrlsb, &lsb, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addrlsb, &lsb, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addrmsb, &msb, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addrmsb, &msb, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getFanTachTarget();
 	return state;
@@ -1110,8 +1817,19 @@ EMC230X_STATUS EMC230X::setFanTachTarget(EMC230X_FAN fan, uint16_t tach)
 
 EMC230X_STATUS EMC230X::setFanValidTachCount(EMC230X_FAN fan, uint8_t count)
 {
-	assert(smbus_read_reg != nullptr);
-	assert(smbus_write_reg != nullptr);
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
+	// The caller must install an SMBus driver via setI2CDriver() first. Reported
+	// rather than asserted so release builds (NDEBUG) fail safe instead of
+	// calling through a null pointer.
+	if (smbus_read_reg == nullptr || smbus_write_reg == nullptr)
+	{
+		return EMC230X_STATUS::EMC230X_SMBUS_DRIVER_NULL;
+	}
 
 	uint8_t addr=0;
 
@@ -1123,8 +1841,12 @@ EMC230X_STATUS EMC230X::setFanValidTachCount(EMC230X_FAN fan, uint8_t count)
 	if (fan == EMC230X_FAN::FANCNTRL_4) addr = EMC230X_REG_FAN4VALTACHCOUNT;
 	if (fan == EMC230X_FAN::FANCNTRL_5) addr = EMC230X_REG_FAN5VALTACHCOUNT;
 
-	state = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, addr, &count, 1);
-	if (state != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, addr, &count, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	state = getFanValidTachCount();
 	return state;
@@ -1135,6 +1857,12 @@ EMC230X_STATUS EMC230X::setFanValidTachCount(EMC230X_FAN fan, uint8_t count)
 // are 2 poles, but this info should be obtained directly from the fan datasheet.
 EMC230X_STATUS EMC230X::setFanPoles(EMC230X_FAN fan, EMC230X_FANPOLES poles)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 	uint8_t multiplier = 0;
 	uint8_t reg = 0;
 	uint8_t configreg = 0;
@@ -1148,6 +1876,13 @@ EMC230X_STATUS EMC230X::setFanPoles(EMC230X_FAN fan, EMC230X_FANPOLES poles)
 	// It will be divided by 2 in the equations relating RPM to tachometer readings.
 
 	EMC230X_STATUS status = getFanConfig1(); // get latest
+
+	// These setters are read-modify-write: bail if the read failed, otherwise we
+	// would write the zeroed cache back over the chip's real configuration.
+	if (status != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return status;
+	}
 
 	switch (fan)
 	{
@@ -1198,8 +1933,12 @@ EMC230X_STATUS EMC230X::setFanPoles(EMC230X_FAN fan, EMC230X_FANPOLES poles)
 		}
 	}
 
-	status = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, reg, &configreg, 1);
-	if (status != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, reg, &configreg, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	status = getFanConfig1(); // get latest
 
@@ -1210,8 +1949,21 @@ EMC230X_STATUS EMC230X::setFanPoles(EMC230X_FAN fan, EMC230X_FANPOLES poles)
 // by the EMC230X using a PID algorithm based on the target tachometer reading given by user.
 EMC230X_STATUS EMC230X::toggleControlAlgorithm(EMC230X_FAN fan, bool enable)
 {
+	// Reject anything that is not exactly one valid fan selector. Without this the
+	// if-chains below leave the register address at 0 and write to register 0x00.
+	if (!isValidFan(fan))
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	}
 
 	EMC230X_STATUS status = getFanConfig1(); // get latest
+
+	// These setters are read-modify-write: bail if the read failed, otherwise we
+	// would write the zeroed cache back over the chip's real configuration.
+	if (status != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return status;
+	}
 
 	uint8_t reg = 0;
 	uint8_t configreg = 0;
@@ -1255,8 +2007,12 @@ EMC230X_STATUS EMC230X::toggleControlAlgorithm(EMC230X_FAN fan, bool enable)
 		}
 	}
 
-	status = (EMC230X_STATUS) smbus_write_reg(I2C_ADDRESS, reg, &configreg, 1);
-	if (status != 0) return EMC230X_STATUS_FAIL;
+	// The driver returns its own int error code, which is not an EMC230X_STATUS --
+	// map it rather than casting a foreign value into the enum.
+	if (smbus_write_reg(i2cAddr, reg, &configreg, 1) != 0)
+	{
+		return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+	}
 
 	status = getFanConfig1(); // get latest
 
@@ -1265,9 +2021,14 @@ EMC230X_STATUS EMC230X::toggleControlAlgorithm(EMC230X_FAN fan, bool enable)
 
 // Obtain the tachometer reading, convert to RPM, and store in a private variable.
 // Get the fan speed (RPM) in RPM
-uint16_t EMC230X::getFanRPM(EMC230X_FAN fan)
+// DONT USE THIS USE THE INTEGER - getFanRPMReading
+EMC230X_STATUS EMC230X::getFanRPM(EMC230X_FAN fan, uint16_t *rpm)
 {
-	uint16_t rpm = 0;
+	if (rpm == nullptr)  return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	if (!isValidFan(fan)) return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+
+	*rpm = 0;
+
 	uint16_t tach = 1;
 	uint8_t edges = 0;
 	float invpoles = 1.0f;
@@ -1276,8 +2037,19 @@ uint16_t EMC230X::getFanRPM(EMC230X_FAN fan)
 	EMC230X_FanConfig1 configReg = {0};
 	EMC230X_FANPOLES poleSetting;
 
-	getFanConfig1();
-	getFanTachReading();
+	// Both refresh the cache this function reads. Propagate their failure instead of
+	// computing a speed from whatever the cache happens to hold.
+	EMC230X_STATUS status = getFanConfig1();
+	if (status != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return status;
+	}
+
+	status = getFanTachReading();
+	if (status != EMC230X_STATUS::EMC230X_STATUS_OK)
+	{
+		return status;
+	}
 
 	switch (fan)
 	{
@@ -1301,24 +2073,109 @@ uint16_t EMC230X::getFanRPM(EMC230X_FAN fan)
 	if ( configReg.FRNG == 2 ) invmult = 0.25f;
 	if ( configReg.FRNG == 3 ) invmult = 0.125f;
 
+	// Full scale means no tach edges arrived -- a stopped or disconnected fan. Valid
+	// observation, so 0 RPM with an OK status. A count of 0 is physically impossible
+	// and would divide by zero (inf cast to uint16_t is undefined behaviour), so it can
+	// only mean the cache is unpopulated; report that as a failure.
+	if (tach >= TACHO_OFF) return EMC230X_STATUS::EMC230X_STATUS_OK;
+	if (tach == 0)         return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+
 	float frpm = invpoles * (edges / (1.0f*tach*invmult)) * ftach * 60.0f;
 
-	return rpm = (uint16_t) frpm;
+	*rpm = (uint16_t) frpm;
 
+	return EMC230X_STATUS::EMC230X_STATUS_OK;
 }
 
-void EMC230X::runControlAlgorithm(EMC230X_FAN fan, uint16_t tachTarget)
+/* RPM from the cached TACH reading, integer only -- Equation 4-3 of the datasheet,
+   RPM = 3932160 * m / COUNT, with m taken from the cached RNG bits.
+
+   Uses cached state and does NO I2C. Call getFanTachReading() (the no-argument
+   overload) first to refresh, otherwise this returns whatever was last read.
+
+   Returns 0 for a stopped or disconnected fan: a full-scale count means no tach
+   edges arrived in the measurement window, which is not a real speed. */
+EMC230X_STATUS EMC230X::getFanRPMReading(EMC230X_FAN fan, uint16_t *rpm)
 {
+	if (rpm == nullptr)  return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+	if (!isValidFan(fan)) return EMC230X_STATUS::EMC230X_STATUS_INVALIDARG;
+
+	*rpm = 0;
+
+	uint16_t tach = getFanTachReading(fan);
+
+	// A full-scale count means no tach edges arrived in the measurement window, i.e. the
+	// fan is stopped or disconnected. That is a valid observation, not an error, so it
+	// reports OK with 0 RPM. A count of 0 cannot occur physically and means the cache was
+	// never populated -- report that as a failure rather than as a stopped fan.
+	if (tach >= TACHO_OFF) return EMC230X_STATUS::EMC230X_STATUS_OK;
+	if (tach == 0)         return EMC230X_STATUS::EMC230X_STATUS_FAIL;
+
+	uint8_t rng = 0;
+	switch (fan)
+	{
+		case EMC230X_FAN::FANCNTRL_1 : rng = emc230xState_.Fan1Config1.FRNG; break;
+		case EMC230X_FAN::FANCNTRL_2 : rng = emc230xState_.Fan2Config1.FRNG; break;
+		case EMC230X_FAN::FANCNTRL_3 : rng = emc230xState_.Fan3Config1.FRNG; break;
+		case EMC230X_FAN::FANCNTRL_4 : rng = emc230xState_.Fan4Config1.FRNG; break;
+		case EMC230X_FAN::FANCNTRL_5 : rng = emc230xState_.Fan5Config1.FRNG; break;
+	}
+
+	uint32_t m = 1u << rng; // RNG 00/01/10/11 -> multiplier 1/2/4/8
+
+	*rpm = (uint16_t) ((TACH_RPM_CONST * m) / tach);
+
+	return EMC230X_STATUS::EMC230X_STATUS_OK;
+}
+
+/* Convert a desired fan speed to a tach count for the settings applied by
+   runControlAlgorithm() (2 pulses/rev, 5 edges, FRNG multiplier 1).
+   0 RPM returns TACHO_OFF, which the chip reads as "drive to 0%".
+   Anything slower than TACH_MIN_RPM is clamped -- the 13-bit count cannot
+   represent it, and the chip would report a stall instead. */
+uint16_t EMC230X::rpmToTachCount(uint16_t rpm)
+{
+	if (rpm == 0) return TACHO_OFF;
+	if (rpm < TACH_MIN_RPM) rpm = TACH_MIN_RPM;
+
+	uint32_t count = TACH_RPM_CONST / rpm;
+	if (count > TACHO_OFF) count = TACHO_OFF;
+
+	return (uint16_t) count;
+}
+
+/* targetRPM is a fan speed, not a raw tach count. 0 parks the fan. */
+void EMC230X::runControlAlgorithm(EMC230X_FAN fan, uint16_t targetRPM)
+{
+	if (!isValidFan(fan))
+	{
+		return;
+	}
+
 	toggleControlAlgorithm(fan, false);
+
+	setFanPoles(fan, EMC230X_FANPOLES::FANPOLE_2); // 2 tach pulses per revolution
+
 	EMC230X_FanConfig1 cfg = {0};
-	setFanPoles(fan, EMC230X_FANPOLES::FANPOLE_2);
-	cfg.UDT = 3;
-	cfg.EDG = 1;  //5 edges
-	cfg.FRNG = 0; //500rpm min, mult = 1
-	cfg.ENAG = 0;
-	setFanConfig1(fan, cfg);
+	cfg.UDT  = 3; // 400 ms PID update -- must exceed the 250 ms measurement at 480 RPM
+	cfg.EDG  = 1; // 5 edges, i.e. 2 pulses/rev. NOT the motor's pole count.
+	cfg.FRNG = 0; // multiplier 1: only setting that measures down to 480 RPM
+	cfg.ENAG = 0; // closed loop enabled at the end, once everything else is set
+	setFanConfig1(fan, cfg);      // 0x8B once ENAG is toggled on
+
+	EMC230X_FanConfig2 cfg2 = {0};
+	cfg2.ERG  = 1; // 50 RPM error window: 1% at 5000 RPM, 5% at 1000. POR is 0 RPM,
+	               // which never stops updating the drive.
+	cfg2.DPT  = 1; // basic derivative -- damps overshoot on a low-inertia 40 mm rotor
+	cfg2.GHEN = 1; // glitch filter on the tach input
+	cfg2.ENRC = 0; // Register 6-14: "available only when ENAGx = 0". Inert in closed
+	               // loop -- there, MaxStep + UDT ramp the drive automatically (4.10).
+	setFanConfig2(fan, cfg2);     // 0x2A
+
 	setFanDriveSettings(fan, 0);
-	setPWMOutput(fan, 0);
+	setPWMOutput(fan, 0);         // open drain -- the fan supplies the pull-up (Intel 4-wire)
+	setPWMBaseFreq(fan, EMC230X_PWMFREQ::FREQ_26KHZ); // Intel 4-wire wants 21-28 kHz
+
 	getFanTachReading();
 	getChipState();
 
@@ -1328,495 +2185,19 @@ void EMC230X::runControlAlgorithm(EMC230X_FAN fan, uint16_t tachTarget)
 	fspuc.SPLV = 7; // 65%
 	fspuc.SPT  = 3; // 2000ms spin up time
 	setFanSpinUpConfig(fan, fspuc);
-	setFanMaxStep(fan, 32);
-	setFanMinDrive(fan, 8);
-	setFanValidTachCount(fan, 0xFE);
-	// RPM = (3932160*1)/TachTarget, Ex 524 RPM = (3932160*1)/7500, 5000 is about 50% duty cycle and loud
-	setFanTachTarget(fan, (uint16_t)(tachTarget) );
+
+	// 4.10 documents the range as 1..31 counts; the register is only F1MS[5:0].
+	// 32 was outside it. 31 with UDT=400 ms ramps 0->100% in ~3.3 s. POR is 0x10.
+	setFanMaxStep(fan, 31);
+	// ponytail: provisional. Keeps the loop above the 480 RPM tach floor, assuming
+	// duty scales roughly linearly from the 20% -> 1050 RPM datasheet point.
+	// Sweep setFanDriveSettings() 0..64 with the loop off and set this from measurement.
+	setFanMinDrive(fan, 26);
+	setFanValidTachCount(fan, 0xFE); // stall below count 8128 ~= 484 RPM
+
+	setFanTachTarget(fan, rpmToTachCount(targetRPM));
+
 	toggleControlAlgorithm(fan, true);
 }
 
 } // end namespace
-
-/*
-
-// Since the tachometer register on the EMC230X has an upper limit, it is necessary to apply multipliers
-// for fans with high RPMs. This is done by adjusting the minimum RPM expected for the fan.
-// The function is written such that the min RPM will be forced to the closest lower RPM.
-EMC230X_STATUS EMC230X::setTachMinRPM(uint16_t minRPM)
-{
-  uint8_t writeByte;
-  if (minRPM < 1000)
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_MINRPM_500;
-    tachMinRPMMultiplier_ = 1;
-  }
-  else if (minRPM < 2000)
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_MINRPM_1000;
-    tachMinRPMMultiplier_ = 2;
-  }
-  else if (minRPM < 4000)
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_MINRPM_2000;
-    tachMinRPMMultiplier_ = 4;
-  }
-  else
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_MINRPM_4000;
-    tachMinRPMMultiplier_ = 8;
-  }
-
-  return writeRegisterBits(EMC230X_REG_FANCONFIG1, EMC230X_REG_FANCONFIG1_MINRPM_CLEAR, writeByte);
-}
-
-
-
-// Adjusts the period between subsequent PWM drive updates.
-// This is only used if toggleRampControl() was enabled.
-// The function is written such that the period will be forced to the closest lower period.
-EMC230X_STATUS EMC230X::setDriveUpdatePeriod(uint16_t periodMs)
-{
-  uint8_t writeByte;
-  if (periodMs < 200)
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_UPDATE_100;
-  }
-  else if (periodMs < 300)
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_UPDATE_200;
-  }
-  else if (periodMs < 400)
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_UPDATE_300;
-  }
-  else if (periodMs < 500)
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_UPDATE_400;
-  }
-  else if (periodMs < 800)
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_UPDATE_500;
-  }
-  else if (periodMs < 1200)
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_UPDATE_800;
-  }
-  else if (periodMs < 1600)
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_UPDATE_1200;
-  }
-  else
-  {
-    writeByte = EMC230X_REG_FANCONFIG1_UPDATE_1600;
-  }
-
-  return writeRegisterBits(EMC230X_REG_FANCONFIG1, EMC230X_REG_FANCONFIG1_UPDATE_CLEAR, writeByte);
-}
-
-// Toggle ramp control for DIRECT CONTROL MODE, whereby the fan speed will be increased gradually.
-// Disabling this will allow fan speed to be changed instantly.
-// Note that enabling the RPM-based Fan Speed Control will automatically use the
-// ramp control, regardless of the status of this function.
-EMC230X_STATUS EMC230X::toggleRampControl(bool enable)
-{
-  if (enable)
-  {
-    return writeRegisterBits(EMC230X_REG_FANCONFIG2, ~EMC230X_REG_FANCONFIG2_RAMPCONTROL, EMC230X_REG_FANCONFIG2_RAMPCONTROL);
-  }
-  else
-  {
-    return writeRegisterBits(EMC230X_REG_FANCONFIG2, ~EMC230X_REG_FANCONFIG2_RAMPCONTROL, 0);
-  }
-}
-
-// Toggle the glitch filter, which removes high frequency noise
-// from the TACH pin.
-EMC230X_STATUS EMC230X::toggleGlitchFilter(bool enable)
-{
-  if (enable)
-  {
-    return writeRegisterBits(EMC230X_REG_FANCONFIG2, ~EMC230X_REG_FANCONFIG2_GLITCHFILTER, EMC230X_REG_FANCONFIG2_GLITCHFILTER);
-  }
-  else
-  {
-    return writeRegisterBits(EMC230X_REG_FANCONFIG2, ~EMC230X_REG_FANCONFIG2_GLITCHFILTER, 0);
-  }
-}
-
-// Change the type of derivative used in the PID algorithm for RPM-based speed control.
-// Refer to Table 5.15 at pg 31 of the datasheet.
-EMC230X_STATUS EMC230X::setDerivativeMode(uint8_t modeType)
-{
-  uint8_t writeByte;
-
-  switch (modeType)
-  {
-  case 0:
-    writeByte = EMC230X_REG_FANCONFIG2_DEROPT_NONE;
-    break;
-  case 1:
-    writeByte = EMC230X_REG_FANCONFIG2_DEROPT_BASIC;
-    break;
-  case 2:
-    writeByte = EMC230X_REG_FANCONFIG2_DEROPT_STEP;
-    break;
-  case 3:
-    writeByte = EMC230X_REG_FANCONFIG2_DEROPT_BOTH;
-  default:
-    return EMC230X_STATUS_INVALIDARG;
-    break;
-  }
-
-  return writeRegisterBits(EMC230X_REG_FANCONFIG2, EMC230X_REG_FANCONFIG2_DEROPT_CLEAR, writeByte);
-}
-
-// Since the tachometer has an accuracy rating, it is not expected that the
-// RPM readings will be constant even if the PWM drive is constant. Therefore,
-// it may be desirable to tell the EMC230X to stop changing PWM drive as long as
-// the RPM reading is within a tolerance of the target. This function does that.
-// The function is written such that the error range will be forced to the closest higher range.
-// The argument should be a positive number.
-EMC230X_STATUS EMC230X::setControlErrRange(uint8_t errorRangeRPM)
-{
-  uint8_t writeByte;
-  if (errorRangeRPM < 0.01) // Account for doubles sometimes not being exactly 0
-  {
-    writeByte = EMC230X_REG_FANCONFIG2_ERRRANGE_0;
-  }
-  else if (errorRangeRPM <= 50)
-  {
-    writeByte = EMC230X_REG_FANCONFIG2_ERRRANGE_50;
-  }
-  else if (errorRangeRPM <= 100)
-  {
-    writeByte = EMC230X_REG_FANCONFIG2_ERRRANGE_100;
-  }
-  else
-  {
-    writeByte = EMC230X_REG_FANCONFIG2_ERRRANGE_200;
-  }
-
-  return writeRegisterBits(EMC230X_REG_FANCONFIG2, EMC230X_REG_FANCONFIG2_ERRRANGE_CLEAR, writeByte);
-}
-
-// Toggle max spin up, whereby the fan is set to 100% duty cycle for 1/4th of the
-// time during the spin up routine.
-EMC230X_STATUS EMC230X::toggleSpinUpMax(bool enable)
-{
-  if (enable)
-  {
-    return writeRegisterBits(EMC230X_REG_FANSPINUP, ~EMC230X_REG_FANSPINUP_NOKICK, EMC230X_REG_FANSPINUP_NOKICK);
-  }
-  else
-  {
-    return writeRegisterBits(EMC230X_REG_FANSPINUP, ~EMC230X_REG_FANSPINUP_NOKICK, 0);
-  }
-}
-
-// Set the drive level that should be used during the spin up routine.
-// The function is written such that the drive will be forced to the closest lower drive.
-EMC230X_STATUS EMC230X::setSpinUpDrive(uint8_t drivePercent)
-{
-  uint8_t writeByte;
-  if (drivePercent < 35)
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINLVL_30;
-  }
-  else if (drivePercent < 40)
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINLVL_35;
-  }
-  else if (drivePercent < 45)
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINLVL_40;
-  }
-  else if (drivePercent < 50)
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINLVL_45;
-  }
-  else if (drivePercent < 55)
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINLVL_50;
-  }
-  else if (drivePercent < 60)
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINLVL_55;
-  }
-  else if (drivePercent < 65)
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINLVL_60;
-  }
-  else
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINLVL_65;
-  }
-
-  return writeRegisterBits(EMC230X_REG_FANSPINUP, EMC230X_REG_FANSPINUP_SPINLVL_CLEAR, writeByte);
-}
-
-// Determine the duration of the spin up routine.
-// The function is written such that the time will be forced to the closest shorter time.
-EMC230X_STATUS EMC230X::setSpinUpTime(uint16_t timeMs)
-{
-  uint8_t writeByte;
-  if (timeMs < 500)
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINUPTIME_250;
-  }
-  else if (timeMs < 1000)
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINUPTIME_500;
-  }
-  else if (timeMs < 2000)
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINUPTIME_1000;
-  }
-  else
-  {
-    writeByte = EMC230X_REG_FANSPINUP_SPINUPTIME_2000;
-  }
-
-  return writeRegisterBits(EMC230X_REG_FANSPINUP, EMC230X_REG_FANSPINUP_SPINUPTIME_CLEAR, writeByte);
-}
-
-// Set the maximum change in fan drive that could be performed over a single
-// update period. Maximum is 0b00111111 (aka 63 or 0x3F)
-EMC230X_STATUS EMC230X::setControlMaxStep(uint8_t stepSize)
-{
-  if (stepSize > EMC230X_REG_FANMAXSTEP_MAX)
-  {
-    stepSize = EMC230X_REG_FANMAXSTEP_MAX;
-  }
-
-  uint8_t data[] = {EMC230X_REG_FANMAXSTEP, stepSize};
-  if (HAL_I2C_Master_Transmit(i2cWire_, I2C_ADDRESS, data, 2, 100) == HAL_OK)
-  //if (i2cWire_->write(I2C_ADDRESS, EMC230X_REG_FANMAXSTEP, stepSize) == I2C_STATUS_OK)
-  {
-    return EMC230X_STATUS_OK;
-  }
-  else
-  {
-    return EMC230X_STATUS_FAIL;
-  }
-}
-
-// Sets the minimum allowable drive for the RPM-based Fan Speed Control algorithm.
-// The algorithm will not drive the fan at a level lower than this unless the
-// tachometer target is specifically set to 0xFF.
-// This is extremely useful for fans that would stop spinning if the PWM signal
-// is low but not zero because once the PWM signal is low enough, the fan stops spinning
-// and the tachometer readings become zero causing the algorithm to drive high and restart
-// the fan, but now the tachometer is above the target. The fan is then driven to a halt again
-// and this process is repeated indefinitely, causing the fan to on-off-on-off......
-// Having a minimum drive prevents this from happening.
-EMC230X_STATUS EMC230X::setFanMinDrive(double minDrivePercent)
-{
-  // Convert the percent to byte format
-  if (minDrivePercent <= 0.0d) minDrivePercent = 0.0d;
-  if (minDrivePercent >= 100.0d) minDrivePercent = 100.0d;
-
-  uint8_t writeByte = (uint8_t) (minDrivePercent / 100 * 255);
-
-  uint8_t data[] = {EMC230X_REG_FANMINDRIVE, writeByte};
-  if (HAL_I2C_Master_Transmit(i2cWire_, I2C_ADDRESS, data, 2, 100) == HAL_OK)
-  //if (i2cWire_->write(I2C_ADDRESS, EMC230X_REG_FANMINDRIVE, writeByte) == I2C_STATUS_OK)
-  {
-    return EMC230X_STATUS_OK;
-  }
-  else
-  {
-    return EMC230X_STATUS_FAIL;
-  }
-}
-
-// Sets the minimum RPM which is checked at the end of the spin up routine to decide if the fan is actually
-// moving or if it is stalled.
-// Internally, the function converts the min RPM to tachometer count that will be written
-// to the appropriate register.
-// NOTE: this value shouldn't be the absolute minimum RPM because it only serves as a check
-// for the spin up routine. Absolute minimum speed should be set at setFanMinDrive(), although
-// that function accepts percentage, not RPM.
-// Also NOTE: the min value is dependent on what was set in setTachMinRPM(). This function will automatically
-// increase the RPM to the lower limit if the given RPM is lower than the one set in setTachMinRPM().
-EMC230X_STATUS EMC230X::setMinValidRPM(uint16_t minRPM)
-{
-  // Ensure the given min RPM is not below the limits of the tachometer.
-  uint16_t tachMinRPM;
-  switch (tachMinRPMMultiplier_)
-  {
-  case 1:
-    tachMinRPM = 500;
-    break;
-  case 2:
-    tachMinRPM = 1000;
-    break;
-  case 3:
-    tachMinRPM = 2000;
-    break;
-  default:
-  case 4:
-    tachMinRPM = 4000;
-    break;
-  }
-
-  if (minRPM < tachMinRPM)
-  {
-    minRPM = tachMinRPM;
-  }
-
-  // To avoid doubles, the fan pole multiplier was multiplied by 2 to make it an integer.
-  // Here, we divide it (and the -1 in the bracket) by 2 to bring it back to its proper value.
-  uint8_t maxTachCount_ = 60 * tachMinRPMMultiplier_ * TACHO_FREQUENCY * (tachFanPolesMultiplier_ - 2) / 2 / fanPoleCount_ / minRPM;
-
-  uint8_t data[] = {EMC230X_REG_FANVALTACHCOUNT, maxTachCount_};
-  if (HAL_I2C_Master_Transmit(i2cWire_, I2C_ADDRESS, data, 2, 100) == HAL_OK)
-  //if (i2cWire_->write(I2C_ADDRESS, EMC230X_REG_FANVALTACHCOUNT, maxTachCount_) == I2C_STATUS_OK)
-  {
-    return EMC230X_STATUS_OK;
-  }
-  else
-  {
-    return EMC230X_STATUS_FAIL;
-  }
-}
-
-// Based on the given target RPM, calculate the appropriate target tachometer reading and
-// write it to the appropriate register.
-// Sanity check for targetRPM to ensure it doesn't cause the calculation to overflow
-// the max value of uint16_t (65535).
-EMC230X_STATUS EMC230X::setRPMTarget(uint16_t targetRPM)
-{
-  // To avoid doubles, the fan pole multiplier was multiplied by 2 to make it an integer.
-  // Here, we divide it (and the -1 in the bracket) by 2 to bring it back to its proper value.
-  uint32_t temp = 60 * tachMinRPMMultiplier_ * TACHO_FREQUENCY * (tachFanPolesMultiplier_ - 2) / 2 / fanPoleCount_ / targetRPM;
-  targetTachCount_ = (temp > 65535) ? 65535 : (uint16_t) temp;
-  return writeTachoTarget(targetTachCount_);
-}
-
-// Turn the fan on (to the most recently known target RPM) or turn it off
-EMC230X_STATUS EMC230X::toggleFan(bool enable)
-{
-  if (enable)
-  {
-    return writeTachoTarget(targetTachCount_);
-  }
-  else
-  {
-    return writeTachoTarget(TACHO_OFF);
-  }
-}
-
-// Obtain the tachometer reading, convert to RPM, and store in a private variable.
-// Get the fan speed (RPM) by calling getFanSpeed().
-EMC230X_STATUS EMC230X::fetchFanSpeed()
-{
-  fanSpeed_ = 0;
-
-  uint8_t data[] = {EMC230X_REG_TACHREADMSB, (uint8_t) 1};
-  if (HAL_I2C_Master_Transmit(i2cWire_, I2C_ADDRESS, data, 2, HAL_MAX_DELAY) != HAL_OK)
-  //if (i2cWire_->read(I2C_ADDRESS, EMC230X_REG_TACHREADMSB, (uint8_t) 1) == I2C_STATUS_OK)
-  {
-	HAL_I2C_Master_Receive(i2cWire_, I2C_ADDRESS, data, 1, 100);
-
-	//uint16_t tachoCount = (i2cWire_->getByte()) << 8;
-	uint16_t tachoCount = (data[0]) << 8;
-
-    data[0] = EMC230X_REG_TACHREADLSB;
-    data[1] = 1;
-    if (HAL_I2C_Master_Transmit(i2cWire_, I2C_ADDRESS, data, 2, 100) != HAL_OK)
-    //if (i2cWire_->read(I2C_ADDRESS, EMC230X_REG_TACHREADLSB, (uint8_t)1) == I2C_STATUS_OK)
-    {
-      HAL_I2C_Master_Receive(i2cWire_, I2C_ADDRESS, data, 1, 100);
-
-      tachoCount |= data[0];
-      //tachoCount |= i2cWire_->getByte();
-      tachoCount = tachoCount >> 3;
-
-      // To avoid doubles, the fan pole multiplier was multiplied by 2 to make it an integer.
-      // Here, we divide it (and the -1 in the bracket) by 2 to bring it back to its proper value.
-      fanSpeed_ = 60 * tachMinRPMMultiplier_ * TACHO_FREQUENCY * (tachFanPolesMultiplier_ - 2) / 2 / fanPoleCount_ / tachoCount;
-    }
-    else
-    {
-      return EMC230X_STATUS_FAIL;
-    }
-  }
-  else
-  {
-    return EMC230X_STATUS_FAIL;
-  }
-  return EMC230X_STATUS_OK;
-}
-
-// Writes specific bits in the given register, such that the other bits in the register
-// are unaffected. This is done by reading the register first, masking the appropriate
-// bits, and then writing this modified byte into the register.
-EMC230X_STATUS EMC230X::writeRegisterBits(uint8_t registerAddress, uint8_t clearingMask, uint8_t byteToWrite)
-{
-  uint8_t data[] = {registerAddress, (uint8_t) 1};
-  if (HAL_I2C_Master_Transmit(i2cWire_, I2C_ADDRESS, data, 2, 100) == HAL_OK)
-  //if (i2cWire_->read(I2C_ADDRESS, registerAddress, (uint8_t) 1) == I2C_STATUS_OK)
-  {
-    //uint8_t registerContents = i2cWire_->getByte();
-	uint8_t registerContents;
-    HAL_I2C_Master_Receive(i2cWire_, I2C_ADDRESS, &registerContents, 1, 100);
-
-    registerContents &= clearingMask; // Reset the bits at the location of interest
-    registerContents |= byteToWrite;  // Write bits to the location of interest
-
-    uint8_t data[] = {registerAddress, registerContents};
-    if (HAL_I2C_Master_Transmit(i2cWire_, I2C_ADDRESS, data, 2, 100) == HAL_OK)
-    //if (i2cWire_->write(I2C_ADDRESS, registerAddress, registerContents) == I2C_STATUS_OK)
-    {
-      return EMC230X_STATUS_OK;
-    }
-    else
-    {
-      return EMC230X_STATUS_FAIL;
-    }
-  }
-  else
-  {
-    return EMC230X_STATUS_FAIL;
-  }
-  return EMC230X_STATUS_FAIL;
-}
-
-EMC230X_STATUS EMC230X::writeTachoTarget(uint16_t tachoTarget)
-{
-  uint8_t tachCountLSB = (tachoTarget << 3) & 0xF8;
-  uint8_t tachCountMSB = (tachoTarget >> 5) & 0xFF;
-
-  // The low byte must be written before the high byte, because
-  // the target is officially changed once the high byte is written (pg 36 of datasheet).
-  uint8_t data[] = {EMC230X_REG_TACHTARGETLSB, tachCountLSB};
-
-  if (HAL_I2C_Master_Transmit(i2cWire_, I2C_ADDRESS, data, 2, 100) == HAL_OK)
-  //if (i2cWire_->write(I2C_ADDRESS, EMC230X_REG_TACHTARGETLSB, tachCountLSB) == I2C_STATUS_OK)
-  {
-	uint8_t data[] = {EMC230X_REG_TACHTARGETMSB, tachCountMSB};
-
-	if (HAL_I2C_Master_Transmit(i2cWire_, I2C_ADDRESS, data, 2, 100) == HAL_OK)
-	//if (i2cWire_->write(I2C_ADDRESS, EMC230X_REG_TACHTARGETMSB, tachCountMSB) == I2C_STATUS_OK)
-    {
-      return EMC230X_STATUS_OK;
-    }
-    else
-    {
-      return EMC230X_STATUS_FAIL;
-    }
-  }
-  else
-  {
-    return EMC230X_STATUS_FAIL;
-  }
-  return EMC230X_STATUS_FAIL;
-}
-*/
-
-
-
-
-
-

@@ -1,9 +1,45 @@
-/*
- * EMC230X.hpp
+/*******************************************************************************
+ * @file      EMC230X.hpp
+ * @brief     Driver for the Microchip EMC2301/2/3/5 RPM-based PWM fan controllers.
  *
- *  Created on: Nov 8, 2024
- *      Author: Michael Margolese
- */
+ * @details   Covers all four parts in the family. The device is identified from its
+ *            product ID on first use and only the fan channels it actually implements
+ *            are accessed -- the registers of an absent fan are reserved.
+ *
+ *            The driver is transport agnostic and makes no platform calls of its own.
+ *            Supply an SMBus/I2C register read and write function through
+ *            setI2CDriver(); both return 0 on success and non-zero on failure.
+ *
+ *            Typical use:
+ * @code
+ *              EMC230X::EMC230X fan;
+ *              fan.setI2CDriver(0x2F, my_smbus_write, my_smbus_read);
+ *
+ *              if (fan.getChipInfo() == EMC230X::EMC230X_STATUS_OK)
+ *              {
+ *                  // closed-loop control at 2000 RPM on fan 1
+ *                  fan.runControlAlgorithm(EMC230X::FANCNTRL_1, 2000);
+ *
+ *                  uint16_t rpm = 0;
+ *                  fan.getFanTachReading();                       // refresh the cache
+ *                  fan.getFanRPMReading(EMC230X::FANCNTRL_1, &rpm);
+ *              }
+ * @endcode
+ *
+ *            All speeds are in RPM. Tach counts, the register justification and the
+ *            RPM conversion are handled internally; see the notes on TACH_RPM_CONST
+ *            and EMC230X_FANPOLES for the arithmetic.
+ *
+ * @note      References: Microchip EMC2301/2/3/5 data sheet DS20006532A, and
+ *            application note AN17.4 "RPM to TACH Counts Conversion".
+ *
+ * @version   1.0
+ * @date      Created  8 November 2024
+ * @date      Modified 11 August 2026
+ *
+ * @author    Michael Margolese
+ * @copyright Copyright (c) 2024-2026 Tenuvah Designs. All rights reserved.
+ ******************************************************************************/
 
 #pragma once
 
@@ -16,13 +52,25 @@
 namespace EMC230X
 {
 
-// Statuses/Errors returned by the functions in this class (Enumerated Types)
+// Driver version, so a consumer can check what it is compiled against rather than
+// relying on the comment block above. Bump the minor for additive changes and the
+// major for anything that breaks an existing caller.
+static constexpr uint8_t EMC230X_DRIVER_VERSION_MAJOR = 1;
+static constexpr uint8_t EMC230X_DRIVER_VERSION_MINOR = 0;
+
+// Statuses/Errors returned by the functions in this class.
+//
+// These are BIT FLAGS, not an ordered list. getChipState() ORs together the result
+// of every individual read, so its return value can be any combination (3, 5, 6, 7)
+// and will not equal a single enumerator. Test it with `== EMC230X_STATUS_OK` for
+// "everything succeeded", or with `&` for a specific failure -- never with
+// `== EMC230X_STATUS_FAIL`. Single-operation calls always return one value.
 typedef enum : uint8_t
 {
   EMC230X_STATUS_OK         = 0,  // No problemo.
-  EMC230X_STATUS_FAIL       = 1,  // Something went wrong.
+  EMC230X_STATUS_FAIL       = 1,  // Something went wrong (SMBus read/write failed).
   EMC230X_STATUS_INVALIDARG = 2,  // The argument given to a function is invalid.
-  EMC230X_SMBUS_DRIVER_NULL = 4
+  EMC230X_SMBUS_DRIVER_NULL = 4   // setI2CDriver() has not been called.
 } EMC230X_STATUS;
 
 typedef enum : uint8_t
@@ -49,12 +97,21 @@ typedef enum : uint8_t
 	MICROCHIP_MANUFACTURER = 0x5D
 } EMC230X_MANUFACTURERID;
 
+// Fan pole count, encoded as the EDG field value rather than the pole count itself:
+// poles = enum value + 1. The datasheet calls a fan "2-pole" when its tachometer
+// emits 2 pulses per revolution, which is what a standard 4-wire PC fan does --
+// that is FANPOLE_2, and it is the chip's reset default.
+//
+// Note this is the TACH pulses per revolution, NOT the motor's magnetic pole count.
+// A 4-pole motor emitting 2 pulses/rev is FANPOLE_2. Per the datasheet the number of
+// edges sampled must equal 2*poles + 1, so picking the wrong one scales every RPM
+// reading by a constant factor.
 typedef enum : uint8_t
 {
-	FANPOLE_1 = 0x0,
-	FANPOLE_2 = 0x1,
-	FANPOLE_3 = 0x2,
-	FANPOLE_4 = 0x3
+	FANPOLE_1 = 0x0, // 3 edges sampled, 1 pulse/rev
+	FANPOLE_2 = 0x1, // 5 edges sampled, 2 pulses/rev -- standard 4-wire fan, default
+	FANPOLE_3 = 0x2, // 7 edges sampled, 3 pulses/rev
+	FANPOLE_4 = 0x3  // 9 edges sampled, 4 pulses/rev
 } EMC230X_FANPOLES;
 
 typedef enum : uint8_t
@@ -62,8 +119,8 @@ typedef enum : uint8_t
 	FREQ_26KHZ    = 0,
 	FREQ_19_53KHZ = 1,
 	FREQ_4_882KHZ = 2,
-	FREQ_2_441KHZ = 4
-} EMMC230X_PWMFREQ;
+	FREQ_2_441KHZ = 3
+} EMC230X_PWMFREQ;
 
 // Data Structures
 typedef union
@@ -394,8 +451,17 @@ private:
 	// Assume that we use internal clock for tachometer
 	static constexpr uint16_t TACHO_FREQUENCY = 32768;
 
-	// 2-byte to be written to tacho target register to turn off fan
-	static constexpr uint16_t TACHO_OFF = 0x1FFF << 3; // 1111 1111 1111 1000
+	// Max 13-bit count. Written to the tach target register it means "fan off".
+	// A plain count -- setFanTachTarget() applies the <<3 register justification.
+	static constexpr uint16_t TACHO_OFF = 0x1FFF;
+
+	// Tach count <-> RPM for a 2-pole fan (2 pulses/rev), 5 edges, FRNG multiplier 1:
+	//   RPM = (1/poles) * (edges-1) * m * f_TACH * 60 / count = 3932160 / count
+	static constexpr uint32_t TACH_RPM_CONST = 3932160u;
+
+	// The count saturates at 0x1FFF, so this is the slowest speed the chip can
+	// measure at multiplier 1. Below it the tach reads stall whatever the fan does.
+	static constexpr uint16_t TACH_MIN_RPM = 480; // 3932160 / 8191
 
 	// List of registers
 	static constexpr uint8_t EMC230X_REG_CONFIGURATION        = 0x20;
@@ -403,7 +469,7 @@ private:
 	static constexpr uint8_t EMC230X_REG_STALLSTATUS          = 0x25;
 	static constexpr uint8_t EMC230X_REG_SPINSTATUS           = 0x26;
 	static constexpr uint8_t EMC230X_REG_DRIVEFAILSTATUS      = 0x27;
-	static constexpr uint8_t EMC230X_REG_INTERUPTENABLE       = 0x29;
+	static constexpr uint8_t EMC230X_REG_INTERRUPTENABLE       = 0x29;
 	static constexpr uint8_t EMC230X_REG_PWMPOLARITY          = 0x2A;
 	static constexpr uint8_t EMC230X_REG_PWMOUTPUT            = 0x2B;
 	static constexpr uint8_t EMC230X_REG_PWMBASEFREQ45        = 0x2C;
@@ -505,7 +571,21 @@ private:
 	smbus_read_register smbus_read_reg;
 
 	sEMC230X_State   emc230xState_;
-	EMC230X_FAN      fanControllers_;
+
+	// Bit mask of the fan channels this part actually has, built from the product ID
+	// by getChipInfo(): EMC2301 = 0x01, EMC2302 = 0x03, EMC2303 = 0x07, EMC2305 = 0x1F.
+	// A mask, so it cannot be an EMC230X_FAN (those are single bits).
+	uint8_t          fanControllers_;
+
+	// Set once getChipInfo() has successfully read the product ID, so fanControllers_
+	// can be trusted. The bulk getters consult ensureIdentified() rather than requiring
+	// the caller to remember the ordering.
+	bool             chipIdentified_;
+
+	// Identify the part on first use. Registers for a fan the part does not implement
+	// are reserved, so the bulk getters need the mask before they can skip them safely.
+	// getChipInfo() touches only chip-level registers, so this cannot recurse.
+	EMC230X_STATUS   ensureIdentified();
 	EMC230X_FANPOLES fan1Poles_;
 	EMC230X_FANPOLES fan2Poles_;
 	EMC230X_FANPOLES fan3Poles_;
@@ -517,6 +597,15 @@ private:
 	uint8_t tachFan3PolesMultiplier_;
 	uint8_t tachFan4PolesMultiplier_;
 	uint8_t tachFan5PolesMultiplier_;
+
+	// True only for exactly one of FANCNTRL_1..5. The setters index registers off a
+	// single fan, so a mask of several fans (or 0) is not a legal argument.
+	static bool isValidFan(EMC230X_FAN fan)
+	{
+		return (fan == EMC230X_FAN::FANCNTRL_1) || (fan == EMC230X_FAN::FANCNTRL_2) ||
+		       (fan == EMC230X_FAN::FANCNTRL_3) || (fan == EMC230X_FAN::FANCNTRL_4) ||
+		       (fan == EMC230X_FAN::FANCNTRL_5);
+	}
 
 public:
 
@@ -550,13 +639,30 @@ public:
   EMC230X_STATUS getFanMinDrive();
   EMC230X_STATUS getDriveFailBand();
   EMC230X_STATUS getFanValidTachCount();
+  // Both of these refresh the whole cached state from the chip: every "get" reads all
+  // five fans' registers whether the part has them or not, so each call is a burst of
+  // blocking SMBus transactions. Call once per control cycle, not per fan.
   EMC230X_STATUS getFanTachTarget();
   EMC230X_STATUS getFanTachReading();
-  uint16_t       getFanRPM(EMC230X_FAN fan);
+
+  // Both report speed through *rpm and the outcome through the return value, so a
+  // stopped fan and a failed read stay distinguishable:
+  //   EMC230X_STATUS_OK  and *rpm == 0  -> fan is genuinely stopped or disconnected
+  //   EMC230X_STATUS_OK  and *rpm  > 0  -> measured speed
+  //   anything else                     -> *rpm is not meaningful
+  // A null rpm pointer returns EMC230X_STATUS_INVALIDARG.
+
+  // Floating point, and re-reads config + all tach registers on every call (~15 SMBus
+  // transactions).
+  EMC230X_STATUS getFanRPM(EMC230X_FAN fan, uint16_t *rpm);
+
+  // Integer equivalent of getFanRPM using only the cached tach count -- no I2C at all.
+  // Call getFanTachReading() first to refresh, or this returns the previous reading.
+  EMC230X_STATUS getFanRPMReading(EMC230X_FAN fan, uint16_t *rpm);
 
   EMC230X_STATUS setPWMPolarity(EMC230X_FAN fan, uint8_t polarity);
   EMC230X_STATUS setPWMOutput(EMC230X_FAN fan, uint8_t iotype);
-  EMC230X_STATUS setPWMBaseFreq(EMC230X_FAN fan, EMMC230X_PWMFREQ freq);
+  EMC230X_STATUS setPWMBaseFreq(EMC230X_FAN fan, EMC230X_PWMFREQ freq);
   EMC230X_STATUS setPWMDivider(EMC230X_FAN fan, uint8_t divider);
 
   EMC230X_STATUS setFanInterrupt(EMC230X_FAN fan, bool enabled);
@@ -575,12 +681,23 @@ public:
 
   EMC230X_STATUS toggleControlAlgorithm(EMC230X_FAN fan, bool enable);
 
-  void runControlAlgorithm(EMC230X_FAN fan, uint16_t tachTarget);
+  void     runControlAlgorithm(EMC230X_FAN fan, uint16_t targetRPM); // RPM, not tach counts. 0 = off.
+  uint16_t rpmToTachCount(uint16_t rpm);
 
   // Data Accessors
   uint16_t          getFanTachReading(EMC230X_FAN fan);
   EMC230X_FANPOLES  getFanPoles(EMC230X_FAN fan);
   EMC230X_STATUS    setFanPoles(EMC230X_FAN fan, EMC230X_FANPOLES poles);
+  // Read-only view of everything the last get*() calls cached. The getters populate this
+  // struct and previously nothing could read most of it back -- getSoftWareLock(), for
+  // one, had no observable effect at all. Values are only as fresh as the matching
+  // get*() call; nothing here triggers bus traffic.
+  const sEMC230X_State &getCachedState() const { return emc230xState_; }
+
+  // Mask of fan channels this part implements (see fanControllers_). The bulk getters
+  // identify the part on first use, so this is populated after any of them has run;
+  // call getChipInfo() explicitly if you need it before that.
+  uint8_t           getAvailableFans() { return fanControllers_; }
   uint8_t           getProductFeatures() { return emc230xState_.ChipInfo.ProductFeatures; } // see datasheet page 48
   EMC230X_PRODUCTID getChipID()   { return (EMC230X_PRODUCTID) emc230xState_.ChipInfo.ProductID; } // see datasheet page 48
   uint8_t           getChipRev()  { return emc230xState_.ChipInfo.Revision; } // see datasheet page 48
